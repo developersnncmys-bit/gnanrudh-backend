@@ -6,7 +6,10 @@ const PieceSchema = new mongoose.Schema({
   vid: { type: String, required: true, index: true },
   status: {
     type: String,
-    enum: ['In stock', 'Reserved', 'Packed', 'Shipped', 'Returned', 'Written off'],
+    // INV-01: new canonical terminal state is 'Sold' (piece has left the warehouse to a
+    // customer). 'Shipped' remains in the enum so historical pieces still validate;
+    // new reservations always transition to Reserved -> Packed -> Sold.
+    enum: ['In stock', 'Reserved', 'Packed', 'Sold', 'Shipped', 'Returned', 'Written off'],
     default: 'In stock',
     index: true,
   },

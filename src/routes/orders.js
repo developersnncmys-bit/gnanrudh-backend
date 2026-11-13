@@ -5,9 +5,12 @@ import { ShipEvent } from '../models/ShipEvent.js';
 import { Singleton } from '../models/Singleton.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
-import { reservePiecesForOrder, releasePiecesForOrder } from './pieces.js';
+import { reservePiecesForOrder, releasePiecesForOrder, shipPiecesForOrder } from './pieces.js';
 import { nextInvoiceNo, nextCnNo, formatInvoice, formatCreditNote } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
+
+// AUD-01: the authenticated user is the audit trail; never trust req.body.by.
+const byFromReq = (req) => req.user?.email || 'System';
 
 // TAX-01: only generate invoice numbers when Settings holds real seller details.
 // Returns {ok, issues}. When !ok, caller skips invoice creation and surfaces issues.
@@ -43,6 +46,17 @@ ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
   const o = await Order.findById(req.params.id);
   if (!o) return res.status(404).json({ error: 'Order not found' });
   if (o.status !== 'Payment pending') return res.status(400).json({ error: 'Order is not pending payment' });
+
+  // INV-01: reserve pieces BEFORE marking the order as paid. If any variant is
+  // sold out, fail the request with 409 — never oversell. reservePiecesForOrder
+  // rolls back any pieces it did claim before throwing.
+  try {
+    await reservePiecesForOrder(o, { by: byFromReq(req) });
+  } catch (e) {
+    if (e.status === 409) return res.status(409).json({ error: 'Not enough stock to fulfil the order', details: e.details });
+    throw e;
+  }
+
   o.payment.status = 'Paid';
   o.status = 'Label generated';
   o.ship.courier = o.ship.courier || 'Delhivery';
@@ -59,7 +73,6 @@ ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
   }
   await o.save();
   await logShip(o, 'Order pushed');
-  try { await reservePiecesForOrder(o); } catch (e) { /* non-fatal: piece reservation is best-effort */ }
   const body = o.toObject();
   if (invoiceBlockedReason) body.invoiceBlocked = invoiceBlockedReason;
   res.json(body);
@@ -78,8 +91,8 @@ ordersRouter.post('/:id/invoice', asyncHandler(async (req, res) => {
   res.json(o.toObject());
 }));
 
-// Cancel
-// Mark packed+shipped from the Packing bench.
+// Mark packed+shipped from the Packing bench. Also transitions the attached pieces
+// Reserved -> Packed -> Sold so stock and the audit log stay consistent (INV-01).
 ordersRouter.post('/:id/ship', asyncHandler(async (req, res) => {
   const o = await Order.findById(req.params.id);
   if (!o) return res.status(404).json({ error: 'Order not found' });
@@ -87,6 +100,7 @@ ordersRouter.post('/:id/ship', asyncHandler(async (req, res) => {
   o.shippedAt = new Date().toISOString();
   await o.save();
   await logShip(o, 'Packed and handed to the courier');
+  await shipPiecesForOrder(o, { codes: req.body?.codes, by: byFromReq(req) });
   res.json(o.toObject());
 }));
 
@@ -95,7 +109,7 @@ ordersRouter.post('/:id/cancel', asyncHandler(async (req, res) => {
   if (!o) return res.status(404).json({ error: 'Order not found' });
   o.status = 'Cancelled';
   await o.save();
-  try { await releasePiecesForOrder(o, `${o._id} cancelled`); } catch (e) { /* non-fatal */ }
+  await releasePiecesForOrder(o, `${o._id} cancelled`, { by: byFromReq(req) });
   res.json(o.toObject());
 }));
 

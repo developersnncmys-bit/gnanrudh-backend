@@ -67,11 +67,12 @@ async function syncProductStockFromPieces(pid) {
 /* ---------- movements on an individual piece ---------- */
 
 piecesRouter.post('/:code/move', asyncHandler(async (req, res) => {
-  const { to, note = '', by = 'Store', oid } = req.body || {};
+  const { to, note = '', oid } = req.body || {};
   if (!to) return res.status(400).json({ error: 'Missing destination status' });
   const piece = await Piece.findById(req.params.code);
   if (!piece) return res.status(404).json({ error: 'Piece not found' });
-  await recordMove(piece, to, note, { by, oid });
+  // AUD-01: `by` is pinned to the authenticated user; any client-supplied `by` is ignored.
+  await recordMove(piece, to, note, { by: req.user?.email || 'System', oid });
   await syncProductStockFromPieces(piece.pid);
   res.json(piece.toObject());
 }));
@@ -94,7 +95,8 @@ piecesRouter.post('/bulk/printed', asyncHandler(async (req, res) => {
 /* ---------- create new pieces when stock is received ---------- */
 
 piecesRouter.post('/receive', asyncHandler(async (req, res) => {
-  const { pid, vid, qty, note = 'Received from the weaver', by = 'Surekha' } = req.body || {};
+  const { pid, vid, qty, note = 'Received from the weaver' } = req.body || {};
+  const by = req.user?.email || 'System'; // AUD-01
   const n = Math.max(0, Number(qty) | 0);
   if (!pid || !vid || !n) return res.status(400).json({ error: 'pid, vid and positive qty required' });
   const prod = await Product.findById(pid);
@@ -126,6 +128,7 @@ piecesRouter.post('/reconcile/:pid', asyncHandler(async (req, res) => {
   const prod = await Product.findById(req.params.pid);
   if (!prod) return res.status(404).json({ error: 'Product not found' });
   const now = new Date().toISOString();
+  const by = req.user?.email || 'System'; // AUD-01
   for (const v of prod.variants) {
     if (!v.sku) continue;
     const have = await Piece.find({ vid: v.id, status: 'In stock' }).lean();
@@ -140,14 +143,14 @@ piecesRouter.post('/reconcile/:pid', asyncHandler(async (req, res) => {
         seq += 1;
         const code = `${v.sku}-${String(seq).padStart(3, '0')}`;
         await Piece.create({ _id: code, pid: prod._id, vid: v.id, status: 'In stock', at: now, received: now, printed: false });
-        await Movement.create({ _id: await nextMoveId(), code, pid: prod._id, vid: v.id, from: '—', to: 'In stock', note: 'Added in the product editor', oid: null, by: 'Surekha', at: now });
+        await Movement.create({ _id: await nextMoveId(), code, pid: prod._id, vid: v.id, from: '—', to: 'In stock', note: 'Added in the product editor', oid: null, by, at: now });
       }
     } else if (have.length > want) {
       const extra = have.slice(want);
       for (const u of extra) {
         const piece = await Piece.findById(u._id);
         if (!piece) continue;
-        await recordMove(piece, 'Written off', 'Stock reduced in the product editor', { by: 'Surekha' });
+        await recordMove(piece, 'Written off', 'Stock reduced in the product editor', { by });
       }
     }
   }
@@ -157,61 +160,153 @@ piecesRouter.post('/reconcile/:pid', asyncHandler(async (req, res) => {
 
 /* ---------- order lifecycle helpers ---------- */
 
-async function reservePiecesForOrder(order) {
+// INV-01: atomic piece reservation. For each line:
+//   findOneAndUpdate({vid, status:'In stock', oid:null}, $set:{status:'Reserved', oid})
+// guarantees only one request wins a given piece, even under 200 concurrent buyers
+// (QA load/oversell-race.js). On failure, every piece claimed by this call is
+// rolled back and a 409-shaped error is thrown.
+//
+// `by` is the audit field for the Movement row (AUD-01). It must come from the
+// authenticated request; callers that invoke outside a request (webhooks,
+// background tasks) pass 'System' explicitly.
+async function reservePiecesForOrder(order, { by = 'System' } = {}) {
+  const reserved = [];
+  const shortages = [];
   for (const it of order.items) {
-    if (it.piece) { const p = await Piece.findById(it.piece); if (p && p.oid === order._id && ['Reserved', 'Packed'].includes(p.status)) continue; }
-    const candidate = await Piece.findOne({ vid: it.vid, status: 'In stock' }).sort({ received: 1 });
-    if (!candidate) { it.short = true; continue; }
-    candidate.oid = order._id;
-    await recordMove(candidate, 'Reserved', `Payment received for ${order._id}`, { by: 'Store' });
-    it.piece = candidate._id;
+    if (it.piece) {
+      const existing = await Piece.findById(it.piece);
+      if (existing && existing.oid === order._id && ['Reserved', 'Packed'].includes(existing.status)) continue;
+    }
+    const at = new Date().toISOString();
+    const claimed = await Piece.findOneAndUpdate(
+      { vid: it.vid, status: 'In stock', oid: null },
+      { $set: { status: 'Reserved', oid: order._id, at } },
+      { new: true, sort: { received: 1 } },
+    );
+    if (!claimed) { shortages.push({ vid: it.vid, qty: it.qty || 1 }); continue; }
+    await Movement.create({
+      _id: await nextMoveId(),
+      code: claimed._id, pid: claimed.pid, vid: claimed.vid,
+      from: 'In stock', to: 'Reserved',
+      note: `Reserved for ${order._id}`,
+      oid: order._id, by, at,
+    });
+    await syncProductStockFromPieces(claimed.pid);
+    it.piece = claimed._id;
     it.short = false;
-    await syncProductStockFromPieces(candidate.pid);
+    reserved.push(claimed._id);
   }
   order.markModified('items');
   await order.save();
+  if (shortages.length) {
+    // Roll back every piece we claimed in this call so the order's left in a clean state.
+    for (const code of reserved) {
+      const rolled = await Piece.findOneAndUpdate(
+        { _id: code, oid: order._id, status: 'Reserved' },
+        { $set: { status: 'In stock', oid: null, at: new Date().toISOString() } },
+        { new: true },
+      );
+      if (rolled) await syncProductStockFromPieces(rolled.pid);
+    }
+    const err = new Error('Not enough pieces in stock to fulfil order');
+    err.status = 409;
+    err.details = shortages;
+    throw err;
+  }
 }
 
-async function releasePiecesForOrder(order, why = 'Order cancelled') {
+async function releasePiecesForOrder(order, why = 'Order cancelled', { by = 'System' } = {}) {
+  // Atomic bulk release. Keeps only pieces held *by this order* from being
+  // returned to stock twice if the endpoint is retried.
   const held = await Piece.find({ oid: order._id, status: { $in: ['Reserved', 'Packed'] } });
   for (const piece of held) {
-    piece.oid = null;
-    await recordMove(piece, 'In stock', why, { by: 'Store' });
-    await syncProductStockFromPieces(piece.pid);
+    const at = new Date().toISOString();
+    const updated = await Piece.findOneAndUpdate(
+      { _id: piece._id, oid: order._id, status: { $in: ['Reserved', 'Packed'] } },
+      { $set: { status: 'In stock', oid: null, at } },
+      { new: true },
+    );
+    if (!updated) continue;
+    await Movement.create({
+      _id: await nextMoveId(),
+      code: updated._id, pid: updated.pid, vid: updated.vid,
+      from: piece.status, to: 'In stock',
+      note: why,
+      oid: null, by, at,
+    });
+    await syncProductStockFromPieces(updated.pid);
   }
   order.items.forEach((it) => { delete it.piece; });
   order.markModified('items');
   await order.save();
 }
 
+// INV-01: packing bench marks the pieces for an order as Sold. Also called from
+// orders.js /:id/ship so the order status and piece lifecycle stay in sync.
+async function shipPiecesForOrder(order, { codes, by = 'System' } = {}) {
+  const toShip = codes && codes.length
+    ? await Piece.find({ _id: { $in: codes }, oid: order._id }).lean()
+    : await Piece.find({ oid: order._id, status: { $in: ['Reserved', 'Packed'] } }).lean();
+  const at = new Date().toISOString();
+  for (const p of toShip) {
+    if (p.status !== 'Packed') {
+      const up = await Piece.findOneAndUpdate(
+        { _id: p._id, oid: order._id, status: 'Reserved' },
+        { $set: { status: 'Packed', at } },
+        { new: true },
+      );
+      if (up) await Movement.create({
+        _id: await nextMoveId(),
+        code: up._id, pid: up.pid, vid: up.vid,
+        from: 'Reserved', to: 'Packed',
+        note: `Scanned at the packing bench for ${order._id}`,
+        oid: order._id, by, at,
+      });
+    }
+    const sold = await Piece.findOneAndUpdate(
+      { _id: p._id, oid: order._id, status: { $in: ['Reserved', 'Packed'] } },
+      { $set: { status: 'Sold', at } },
+      { new: true },
+    );
+    if (sold) await Movement.create({
+      _id: await nextMoveId(),
+      code: sold._id, pid: sold.pid, vid: sold.vid,
+      from: 'Packed', to: 'Sold',
+      note: `Handed to ${order.ship?.courier || 'courier'}${order.ship?.awb ? `, AWB ${order.ship.awb}` : ''}`,
+      oid: order._id, by, at,
+    });
+  }
+  return toShip.length;
+}
+
+// AUD-01: `by` on every Movement comes from the authenticated user, never the client body.
+const byFromReq = (req) => req.user?.email || 'System';
+
 piecesRouter.post('/order/:oid/reserve', asyncHandler(async (req, res) => {
   const o = await Order.findById(req.params.oid);
   if (!o) return res.status(404).json({ error: 'Order not found' });
-  await reservePiecesForOrder(o);
+  try {
+    await reservePiecesForOrder(o, { by: byFromReq(req) });
+  } catch (e) {
+    if (e.status === 409) return res.status(409).json({ error: e.message, details: e.details });
+    throw e;
+  }
   res.json(o.toObject());
 }));
 
 piecesRouter.post('/order/:oid/release', asyncHandler(async (req, res) => {
   const o = await Order.findById(req.params.oid);
   if (!o) return res.status(404).json({ error: 'Order not found' });
-  await releasePiecesForOrder(o, req.body?.why || 'Order cancelled');
+  await releasePiecesForOrder(o, req.body?.why || 'Order cancelled', { by: byFromReq(req) });
   res.json(o.toObject());
 }));
 
 piecesRouter.post('/order/:oid/ship', asyncHandler(async (req, res) => {
   const o = await Order.findById(req.params.oid);
   if (!o) return res.status(404).json({ error: 'Order not found' });
-  const codes = Array.isArray(req.body?.codes) && req.body.codes.length
-    ? req.body.codes
-    : (await Piece.find({ oid: o._id, status: { $in: ['Reserved', 'Packed'] } }).lean()).map((p) => p._id);
-  const at = new Date().toISOString();
-  for (const code of codes) {
-    const piece = await Piece.findById(code);
-    if (!piece) continue;
-    if (piece.status !== 'Packed') await recordMove(piece, 'Packed', `Scanned at the packing bench for ${o._id}`, { by: 'Packing bench', at });
-    await recordMove(piece, 'Shipped', `Handed to ${o.ship?.courier || 'courier'}${o.ship?.awb ? `, AWB ${o.ship.awb}` : ''}`, { by: 'Packing bench', at });
-  }
-  res.json({ ok: true, shipped: codes.length });
+  const codes = Array.isArray(req.body?.codes) ? req.body.codes : null;
+  const shipped = await shipPiecesForOrder(o, { codes, by: byFromReq(req) });
+  res.json({ ok: true, shipped });
 }));
 
-export { reservePiecesForOrder, releasePiecesForOrder };
+export { reservePiecesForOrder, releasePiecesForOrder, shipPiecesForOrder };
