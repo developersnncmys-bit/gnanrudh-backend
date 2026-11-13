@@ -11,6 +11,15 @@ const base = crudRouter(Product, {
 
 export const productsRouter = Router();
 
+// INV-02: variant.stock is derived from Piece documents and is NOT writable through
+// the product API. Any incoming write that tries to set it is quietly dropped.
+productsRouter.use((req, res, next) => {
+  if (['POST', 'PUT', 'PATCH'].includes(req.method) && Array.isArray(req.body?.variants)) {
+    req.body.variants = req.body.variants.map((v) => { const { stock, ...rest } = v; return rest; });
+  }
+  next();
+});
+
 // Bulk status update: PATCH /products/bulk  { ids: [], status: '...' }
 productsRouter.patch('/bulk', asyncHandler(async (req, res) => {
   const { ids, status } = req.body;
