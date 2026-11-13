@@ -24,7 +24,12 @@ const CustomerSchema = new mongoose.Schema({
   addresses: { type: Number, default: 1 },
   profiles: { type: [ProfileSchema], default: [] },
   notes: { type: [NoteSchema], default: [] },
-  wishlist: { type: [String], default: [] },
+  // CUS-01: wishlist is a set — duplicates collapse on save.
+  wishlist: {
+    type: [String],
+    default: [],
+    set: (v) => Array.isArray(v) ? [...new Set(v.filter(Boolean))] : [],
+  },
   orders: { type: [String], default: [] },
   since: String,
   source: String,

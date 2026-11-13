@@ -10,6 +10,7 @@ import { Movement } from '../models/Movement.js';
 import { nextCnNo, formatCreditNote } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
 import { Singleton } from '../models/Singleton.js';
+import { recomputeCustomer } from '../crm.js';
 
 const base = crudRouter(Return, {
   searchFields: ['_id', 'oid', 'reason'],
@@ -135,6 +136,7 @@ returnsRouter.post('/:id/refund', asyncHandler(async (req, res) => {
     o.creditNote = formatCreditNote(now, seq);
     o.payment.status = 'Refunded';
     await o.save();
+    await recomputeCustomer(o.cid); // DATA-04
   }
 
   const p = await Product.findById(r.pid);

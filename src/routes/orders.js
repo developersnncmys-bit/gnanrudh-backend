@@ -8,6 +8,7 @@ import { asyncHandler } from '../middleware/asyncHandler.js';
 import { reservePiecesForOrder, releasePiecesForOrder, shipPiecesForOrder } from './pieces.js';
 import { nextInvoiceNo, nextCnNo, formatInvoice, formatCreditNote } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
+import { recomputeCustomer } from '../crm.js';
 
 // AUD-01: the authenticated user is the audit trail; never trust req.body.by.
 const byFromReq = (req) => req.user?.email || 'System';
@@ -73,6 +74,7 @@ ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
   }
   await o.save();
   await logShip(o, 'Order pushed');
+  await recomputeCustomer(o.cid); // DATA-04: payment just flipped to Paid, LTV/segment need refresh.
   const body = o.toObject();
   if (invoiceBlockedReason) body.invoiceBlocked = invoiceBlockedReason;
   res.json(body);
@@ -110,6 +112,7 @@ ordersRouter.post('/:id/cancel', asyncHandler(async (req, res) => {
   o.status = 'Cancelled';
   await o.save();
   await releasePiecesForOrder(o, `${o._id} cancelled`, { by: byFromReq(req) });
+  await recomputeCustomer(o.cid); // DATA-04
   res.json(o.toObject());
 }));
 
@@ -151,6 +154,7 @@ ordersRouter.post('/:id/refund', asyncHandler(async (req, res) => {
   const now = new Date();
   o.creditNote = formatCreditNote(now, await nextCnNo(now));
   await o.save();
+  await recomputeCustomer(o.cid); // DATA-04
   res.json(o.toObject());
 }));
 
