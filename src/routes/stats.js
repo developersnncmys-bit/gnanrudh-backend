@@ -9,6 +9,69 @@ import { asyncHandler } from '../middleware/asyncHandler.js';
 
 export const statsRouter = Router();
 
+// PERF-02: one endpoint that returns everything the dashboard needs: KPIs, queue
+// counts, revenue series, sales-by-category. Replaces the 17 Promise.all list()
+// calls the admin currently fires on bootstrap. The admin can migrate off those
+// one module at a time.
+statsRouter.get('/dashboard/summary', asyncHandler(async (req, res) => {
+  const range = Math.max(1, Math.min(90, Number(req.query.range) || 7));
+  const curStart = istMidnightDaysAgo(range);
+  const prevStart = istMidnightDaysAgo(2 * range);
+  const now = new Date();
+  const paidMatch = (from, to) => ({ 'payment.status': { $in: ['Paid', 'COD collected'] }, placed: { $gte: from.toISOString(), $lt: to.toISOString() } });
+
+  const [cur, prev, codPending, queueDoc, buyers, repeaters, salesByCat, series] = await Promise.all([
+    Order.aggregate([
+      { $match: paidMatch(curStart, now) },
+      { $group: { _id: null, revenue: { $sum: '$total' }, count: { $sum: 1 }, cod: { $sum: { $cond: [{ $eq: ['$payment.method', 'Cash on delivery'] }, 1, 0] } } } },
+    ]),
+    Order.aggregate([
+      { $match: paidMatch(prevStart, curStart) },
+      { $group: { _id: null, revenue: { $sum: '$total' }, count: { $sum: 1 } } },
+    ]),
+    Order.aggregate([
+      { $match: { 'payment.status': 'COD pending' } },
+      { $group: { _id: null, amount: { $sum: '$total' }, count: { $sum: 1 } } },
+    ]),
+    Promise.all([
+      Order.countDocuments({ status: 'Payment pending' }),
+      Order.countDocuments({ status: 'Delivery failed' }),
+      Return.countDocuments({ status: 'Requested' }),
+      Return.countDocuments({ status: 'Received' }),
+      Review.countDocuments({ status: 'Pending' }),
+      Product.countDocuments({ status: 'Draft' }),
+      ShipEvent.countDocuments({ webhook: { $ne: 'Received' } }),
+    ]).then(([pending, ndr, retReview, retRefund, reviews, drafts, webhook]) => ({ pending, ndr, retReview, retRefund, reviews, drafts, webhook })),
+    Customer.countDocuments({ orderCount: { $gte: 1 } }),
+    Customer.countDocuments({ orderCount: { $gte: 2 } }),
+    Order.aggregate([
+      { $match: { 'payment.status': { $in: ['Paid', 'COD collected'] }, placed: { $gte: curStart.toISOString() } } },
+      { $unwind: '$items' },
+      { $lookup: { from: 'products', localField: 'items.pid', foreignField: '_id', as: 'product' } },
+      { $unwind: '$product' },
+      { $group: { _id: '$product.cat', value: { $sum: '$items.price' } } },
+      { $sort: { value: -1 } },
+    ]),
+    Order.aggregate([
+      { $match: { 'payment.status': { $in: ['Paid', 'COD collected'] }, placed: { $gte: curStart.toISOString() } } },
+      { $group: { _id: { $substr: ['$placed', 0, 10] }, value: { $sum: '$total' } } },
+      { $sort: { _id: 1 } },
+    ]),
+  ]);
+
+  res.json({
+    range,
+    current: cur[0] || { revenue: 0, count: 0, cod: 0 },
+    previous: prev[0] || { revenue: 0, count: 0 },
+    codToCollect: codPending[0] || { amount: 0, count: 0 },
+    queue: queueDoc,
+    repeatCustomers: repeaters,
+    totalBuyers: buyers,
+    salesByCat: salesByCat.map((r) => ({ cat: r._id, value: r.value })),
+    revenueSeries: series.map((r) => ({ date: r._id, value: r.value })),
+  });
+}));
+
 // GET /stats/queue — counts used by the admin's sidebar badges + dashboard
 statsRouter.get('/queue', asyncHandler(async (req, res) => {
   const [pending, ndr, retReview, retRefund, reviews, drafts, webhook, oos] = await Promise.all([
