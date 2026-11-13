@@ -8,6 +8,8 @@ import { asyncHandler } from '../middleware/asyncHandler.js';
 import { Piece } from '../models/Piece.js';
 import { Movement } from '../models/Movement.js';
 import { nextCnNo, formatCreditNote } from '../invoicing.js';
+import { settingsReady } from '../validators.js';
+import { Singleton } from '../models/Singleton.js';
 
 const base = crudRouter(Return, {
   searchFields: ['_id', 'oid', 'reason'],
@@ -61,6 +63,10 @@ returnsRouter.post('/:id/received', asyncHandler(async (req, res) => {
 returnsRouter.post('/:id/refund', asyncHandler(async (req, res) => {
   const r = await Return.findById(req.params.id);
   if (!r) return res.status(404).json({ error: 'Return not found' });
+  const settings = await Singleton.findById('settings').lean();
+  const ready = settingsReady(settings?.data);
+  if (!ready.ok) return res.status(409).json({ error: 'Seller details on Settings are not complete; cannot issue credit note', issues: ready.issues });
+
   r.status = 'Refunded';
   await r.save();
 

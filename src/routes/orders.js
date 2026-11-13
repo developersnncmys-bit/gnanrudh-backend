@@ -7,6 +7,14 @@ import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { reservePiecesForOrder, releasePiecesForOrder } from './pieces.js';
 import { nextInvoiceNo, nextCnNo, formatInvoice, formatCreditNote } from '../invoicing.js';
+import { settingsReady } from '../validators.js';
+
+// TAX-01: only generate invoice numbers when Settings holds real seller details.
+// Returns {ok, issues}. When !ok, caller skips invoice creation and surfaces issues.
+async function sellerReady() {
+  const s = await Singleton.findById('settings').lean();
+  return settingsReady(s?.data);
+}
 
 const base = crudRouter(Order, {
   searchFields: ['_id', 'ship.awb', 'payment.rzp'],
@@ -39,13 +47,34 @@ ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
   o.status = 'Label generated';
   o.ship.courier = o.ship.courier || 'Delhivery';
   o.ship.awb = o.ship.awb || `${Math.floor(10000000 + Math.random() * 89999999)}11`;
+  let invoiceBlockedReason = null;
   if (!o.invoice) {
-    const now = new Date();
-    o.invoice = formatInvoice(now, await nextInvoiceNo(now));
+    const ready = await sellerReady();
+    if (ready.ok) {
+      const now = new Date();
+      o.invoice = formatInvoice(now, await nextInvoiceNo(now));
+    } else {
+      invoiceBlockedReason = ready.issues;
+    }
   }
   await o.save();
   await logShip(o, 'Order pushed');
   try { await reservePiecesForOrder(o); } catch (e) { /* non-fatal: piece reservation is best-effort */ }
+  const body = o.toObject();
+  if (invoiceBlockedReason) body.invoiceBlocked = invoiceBlockedReason;
+  res.json(body);
+}));
+
+// TAX-01: retry assigning an invoice number after seller details have been filled in.
+ordersRouter.post('/:id/invoice', asyncHandler(async (req, res) => {
+  const o = await Order.findById(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  if (o.invoice) return res.json(o.toObject());
+  const ready = await sellerReady();
+  if (!ready.ok) return res.status(409).json({ error: 'Seller details on Settings are not complete', issues: ready.issues });
+  const now = new Date();
+  o.invoice = formatInvoice(now, await nextInvoiceNo(now));
+  await o.save();
   res.json(o.toObject());
 }));
 
@@ -103,6 +132,8 @@ ordersRouter.post('/:id/refund', asyncHandler(async (req, res) => {
   const amt = Number(amount);
   if (!(amt > 0 && amt <= o.total)) return res.status(400).json({ error: `Amount must be between 1 and ${o.total}` });
   o.payment.status = 'Refunded';
+  const ready = await sellerReady();
+  if (!ready.ok) return res.status(409).json({ error: 'Seller details on Settings are not complete; cannot issue credit note', issues: ready.issues });
   const now = new Date();
   o.creditNote = formatCreditNote(now, await nextCnNo(now));
   await o.save();

@@ -33,3 +33,28 @@ export const compareAtValidator = function validate(v) {
   // Mongoose runs validators as methods — `this` is the doc being saved.
   return v == null || (typeof v === 'number' && v > this.price);
 };
+
+// TAX-01: check whether seller details on Settings are real enough to print a tax invoice.
+// Blocks the seeded placeholders (`29ABCDE1234F1Z5`, phone with x's, "Bengaluru, Karnataka
+// 560001" bare address) from leaking onto a GST invoice.
+const PLACEHOLDER_GSTIN = '29ABCDE1234F1Z5';
+const PLACEHOLDER_ADDR_RE = /^Bengaluru,?\s*Karnataka\s*\d{6}$/i;
+
+export function settingsReady(data) {
+  const store = data?.store || {};
+  const gst = data?.gst || {};
+  const issues = [];
+  const gstin = (gst.gstin || '').trim();
+  if (!gstin) issues.push('GSTIN is empty');
+  else if (gstin === PLACEHOLDER_GSTIN) issues.push('GSTIN is still the placeholder 29ABCDE1234F1Z5');
+  else if (!isGSTIN(gstin)) issues.push('GSTIN format is invalid');
+  const phone = (store.phone || '').trim();
+  if (!phone) issues.push('Business phone is empty');
+  else if (/x/i.test(phone)) issues.push('Business phone is still the placeholder (+91 98xxx xxxxx)');
+  const addr = (store.address || '').trim();
+  if (!addr) issues.push('Business address is empty');
+  else if (addr.length < 20 || PLACEHOLDER_ADDR_RE.test(addr)) issues.push('Business address is too short or still the placeholder');
+  const name = (store.name || '').trim();
+  if (!name) issues.push('Business name is empty');
+  return { ok: issues.length === 0, issues };
+}
