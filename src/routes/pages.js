@@ -1,8 +1,23 @@
 import { Router } from 'express';
 import { CmsPage } from '../models/CmsPage.js';
+import { Singleton } from '../models/Singleton.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 
 export const pagesRouter = Router();
+
+// LEGAL-01: substitute policy tokens like {{returnWindow}} using current Settings,
+// so the Returns policy page stays in sync when the window or rules are edited.
+function substituteTokens(body, settings) {
+  if (!body) return body;
+  const policy = settings?.policy || {};
+  const ship = settings?.ship || {};
+  const tokens = {
+    returnWindow: policy.window ? `${policy.window} days` : '',
+    returnConditions: policy.conditions || '',
+    reverseShippingRule: policy.reverseShipping || ship.returnPolicy || '',
+  };
+  return String(body).replace(/\{\{(\w+)\}\}/g, (full, key) => (key in tokens ? tokens[key] : full));
+}
 
 pagesRouter.get('/', asyncHandler(async (req, res) => {
   const items = await CmsPage.find().sort({ name: 1 }).lean();
@@ -12,6 +27,11 @@ pagesRouter.get('/', asyncHandler(async (req, res) => {
 pagesRouter.get('/:name', asyncHandler(async (req, res) => {
   const p = await CmsPage.findOne({ name: req.params.name }).lean();
   if (!p) return res.status(404).json({ error: 'Page not found' });
+  // Only substitute for the rendered body — admin editor should see the raw tokens
+  // so authors can edit them. ?raw=1 suppresses substitution.
+  if (req.query.raw) return res.json(p);
+  const settings = await Singleton.findById('settings').lean();
+  p.body = substituteTokens(p.body, settings?.data);
   res.json(p);
 }));
 

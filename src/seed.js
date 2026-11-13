@@ -227,7 +227,15 @@ const pages = [
   ['Privacy policy', 'How customer and measurement data is used.', 60],
   ['Terms of use', 'Terms for using the store.', 60],
   ['GST policy', 'Tax invoices, credit notes and GSTIN details.', 30],
-].map(([name, desc, d]) => ({ name, desc, updated: iso(addDays(TODAY, -d)), body: `${name}\n\n${desc}` }));
+].map(([name, desc, d]) => {
+  // LEGAL-01: stub bodies, flagged by the admin "Stub body" badge until they cross 800 chars.
+  // Returns policy is pre-populated with the Settings tokens so the admin sees how to use them.
+  let body = `# ${name}\n\n${desc}\n\nTODO: supply full policy text.`;
+  if (name === 'Returns policy') {
+    body = `# Returns policy\n\nWe accept returns within {{returnWindow}} of delivery.\n\n## Conditions\n\n{{returnConditions}}\n\n## Reverse shipping\n\n{{reverseShippingRule}}\n\nTODO: supply full policy text (headings, lists, links). The tokens above pull their values from Settings so this page stays in sync when you change the return window or conditions.`;
+  }
+  return { name, desc, updated: iso(addDays(TODAY, -d)), body };
+});
 
 const SETTINGS = {
   store: { name: 'House of GnanRudh', site: 'houseofgnanrudh.com', phone: '+91 98xxx xxxxx', email: 'care@houseofgnanrudh.com', address: 'Bengaluru, Karnataka 560001' },
