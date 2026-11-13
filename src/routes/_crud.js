@@ -26,12 +26,20 @@ export function crudRouter(Model, {
 
   router.get('/', asyncHandler(async (req, res) => {
     const filter = {};
-    for (const k of filterKeys) if (req.query[k] !== undefined && req.query[k] !== '') filter[k] = req.query[k];
+    // Coerce every filter value to a string. Blocks ?status[$ne]=... operator-injection
+    // where Express turns bracketed query params into objects that Mongo would honour.
+    for (const k of filterKeys) {
+      const v = req.query[k];
+      if (v === undefined || v === '' || typeof v === 'object') continue;
+      filter[k] = String(v);
+    }
     if (req.query.q && searchFields.length) {
       const rx = new RegExp(String(req.query.q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       filter.$or = searchFields.map((f) => ({ [f]: rx }));
     }
-    const sort = req.query.sort ? { [req.query.sort]: req.query.dir === 'asc' ? 1 : -1 } : defaultSort;
+    // sort key is a model field name; strip any dotted or $ keys to kill prototype/operator abuse.
+    const sortKey = typeof req.query.sort === 'string' ? req.query.sort.replace(/[.$]/g, '') : '';
+    const sort = sortKey ? { [sortKey]: req.query.dir === 'asc' ? 1 : -1 } : defaultSort;
     const limit = req.query.limit !== undefined ? Number(req.query.limit) : limitDefault;
     const skip = Number(req.query.skip) || 0;
     const [items, total] = await Promise.all([

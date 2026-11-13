@@ -13,7 +13,9 @@ export const movementsRouter = Router();
 piecesRouter.get('/', asyncHandler(async (req, res) => {
   const filter = {};
   for (const k of ['pid', 'vid', 'status', 'oid']) {
-    if (req.query[k] !== undefined && req.query[k] !== '') filter[k] = req.query[k];
+    const v = req.query[k];
+    if (v === undefined || v === '' || typeof v === 'object') continue;
+    filter[k] = String(v);
   }
   const items = await Piece.find(filter).sort({ at: -1 }).lean();
   res.json({ items, total: items.length });
