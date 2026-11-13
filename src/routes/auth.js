@@ -3,19 +3,26 @@ import bcrypt from 'bcryptjs';
 import { User } from '../models/User.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { signToken, requireAuth } from '../middleware/auth.js';
+import { loginLimit, recordLoginFailure } from '../middleware/loginLimiter.js';
 
 export const authRouter = Router();
 
 // POST /api/auth/login  { email, password } → { token, user }
-authRouter.post('/login', asyncHandler(async (req, res) => {
+authRouter.post('/login', loginLimit, asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
 
   const user = await User.findOne({ email: String(email).toLowerCase().trim() });
-  if (!user) return res.status(401).json({ error: 'Incorrect email or password' });
+  if (!user) {
+    await recordLoginFailure(req.loginAttempt);
+    return res.status(401).json({ error: 'Incorrect email or password' });
+  }
 
   const ok = await bcrypt.compare(String(password), user.passwordHash);
-  if (!ok) return res.status(401).json({ error: 'Incorrect email or password' });
+  if (!ok) {
+    await recordLoginFailure(req.loginAttempt);
+    return res.status(401).json({ error: 'Incorrect email or password' });
+  }
 
   user.lastLoginAt = new Date();
   await user.save();

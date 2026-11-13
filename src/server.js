@@ -28,7 +28,15 @@ import { seedPiecesFromStock } from './seedPieces.js';
 
 const app = express();
 
-app.use(cors({ origin: config.corsOrigins, credentials: true }));
+// SEC-04: trust the Vercel proxy so req.ip and X-Forwarded-For hold the real client IP.
+app.set('trust proxy', 1);
+
+app.use(cors({
+  origin: config.corsOrigins,
+  credentials: true,
+  // SEC-03: expose the refreshed-token header so the admin can pick it up.
+  exposedHeaders: ['X-Refreshed-Token'],
+}));
 app.use(express.json({ limit: '2mb' }));
 
 // Ensure DB is connected before handling any request (safe for serverless cold starts)
