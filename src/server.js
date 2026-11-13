@@ -31,6 +31,11 @@ const app = express();
 app.use(cors({ origin: config.corsOrigins, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 
+// Ensure DB is connected before handling any request (safe for serverless cold starts)
+app.use(async (req, res, next) => {
+  try { await connectDB(); next(); } catch (e) { next(e); }
+});
+
 // Serve uploaded files publicly (no CORS needed — <img>/<video> tags don't check CORS)
 app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '7d', immutable: true }));
 
@@ -62,18 +67,22 @@ app.use('/api/movements', requireAuth, movementsRouter);
 app.use(notFound);
 app.use(errorHandler);
 
-async function main() {
-  await connectDB();
-  try {
-    const r = await seedPiecesFromStock();
-    if (!r.skipped) console.log(`[server] seeded ${r.seeded} pieces from existing stock`);
-  } catch (e) { console.warn('[server] piece seed failed:', e.message); }
-  app.listen(config.port, () => {
-    console.log(`[server] listening on http://localhost:${config.port}`);
+export default app;
+
+// Only start a listening HTTP server when run directly (local dev).
+// On Vercel, the file is imported as a serverless function and this block is skipped.
+if (process.env.VERCEL !== '1' && import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}`) {
+  (async () => {
+    await connectDB();
+    try {
+      const r = await seedPiecesFromStock();
+      if (!r.skipped) console.log(`[server] seeded ${r.seeded} pieces from existing stock`);
+    } catch (e) { console.warn('[server] piece seed failed:', e.message); }
+    app.listen(config.port, () => {
+      console.log(`[server] listening on http://localhost:${config.port}`);
+    });
+  })().catch((err) => {
+    console.error('[server] fatal', err);
+    process.exit(1);
   });
 }
-
-main().catch((err) => {
-  console.error('[server] fatal', err);
-  process.exit(1);
-});
