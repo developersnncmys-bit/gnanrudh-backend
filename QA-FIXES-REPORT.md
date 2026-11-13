@@ -195,6 +195,133 @@ Every Phase 2 issue ID has shipped. Admin build and backend syntax are clean.
 
 ---
 
-## Phase 3, 4
+## Phase 3 — done
 
-Pending. Will append here as each lands.
+| ID | Status | Backend commits | Admin commits |
+|---|---|---|---|
+| PERF-03/04/ORD-03 | fixed | `8606d5a` | `2f54138` |
+| DATA-01/02 | fixed | — | `73731a7` |
+| PERF-02 | fixed — admin migration pending | `6225cbc` | — |
+| PERF-01 | fixed | `8030a10` | — |
+| SHIP-01 | fixed — Shiprocket client stubbed | `e6412ad` | — |
+
+### What Phase 3 changes operationally
+
+1. **Lists are paginated.** `limit=0` is no longer "everything" — default page is
+   50, hard cap 100. `page` and `skip` params both work. The admin's `list()`
+   helper transparently pages through, so existing in-memory UX still works
+   until the full lazy-load lands.
+2. **Simulated analytics are gone.** `analytics.connected` defaults to false;
+   every panel that used to show seeded numbers (visitors, funnel, sources,
+   abandoned carts, cohorts) renders an empty state linking to Settings.
+   Payment / category / city numbers come from real order data as before.
+3. **Dashboard summary endpoint exists.** `GET /api/stats/dashboard/summary?range=7`
+   returns KPIs, queue counts, revenue series, and sales-by-category in one
+   aggregation. The admin bootstrap hasn't been rewritten to use it yet — that
+   is a big refactor since every drawer in the admin reads from in-memory
+   `PROD[]`, `CUST[]`, `ORD[]` maps hydrated at boot. Migration plan:
+     a. Dashboard first (read from `/dashboard/summary`, no PRODs needed).
+     b. Each list page (Orders, Products, Customers) switches to paginated
+        reads with server-side search/filter.
+     c. Drawers read-on-demand from `/orders/:id`, `/products/:id`, etc.
+     d. Remove the `list()` bootstrap.
+4. **Mongo pool + indexes.** `maxPoolSize: 10` on the Mongoose connect prevents
+   a cold-start burst from opening 1,500 sockets. Compound indexes added on
+   every hot query path:
+     - orders `{status:1, placed:-1}`, `{invoice:1}` unique sparse
+     - pieces `{vid:1, status:1}`
+     - products `{status:1, cat:1, price:1}`
+     - returns `{status:1, requested:-1}`
+     - shipping `{oid:1, at:-1}`
+   Mongoose will CREATE these indexes on the next deploy — plan for a ~minute
+   of background build on a busy cluster.
+5. **Vercel region.** `backend/vercel.json` now pins functions to `bom1`
+   (Mumbai). Move the Atlas cluster to `ap-south-1` next (admin console →
+   cluster → region). Round-trip to Mongo drops from ~150ms (default US-East)
+   to ~5ms once both are in Mumbai.
+6. **Shiprocket webhooks are idempotent + retried.** New endpoints:
+     - `POST /api/shipping/webhook` — upsert on `webhookEventId` so a replayed
+       event is a no-op.
+     - `POST /api/shipping/:id/sync` — hits Shiprocket, updates attempts +
+       backoff, sets `Retrying` / `Failed` / `Received`.
+     - `POST /api/shipping/retry-due` — cron-callable; sweeps every event
+       whose `webhookNextAt` has passed. **Add a Vercel Cron** hitting this
+       endpoint every 5 min.
+   `src/shiprocket.js` is a stub. Fill `callShiprocket()` with the real Track
+   API call once you have the token.
+
+### Extra things you still owe me (adds to Phase 1+2 list)
+
+9. **Atlas cluster region** (PERF-01) — move to `ap-south-1` so bom1 Vercel +
+   Atlas round-trip is ~5ms.
+10. **Vercel Cron for SHIP-01** — Project → Settings → Cron Jobs → schedule
+    `POST /api/shipping/retry-due` every 5 minutes.
+11. **SHIPROCKET_TOKEN env var** (SHIP-01) — fill `callShiprocket()` in
+    `src/shiprocket.js` with the real Track API call, set the env var.
+12. **Analytics provider** (DATA-01/02) — pick one (GA4 / PostHog / Clarity);
+    wire the client JS; add a `/stats/analytics` endpoint on the backend that
+    returns the funnel/sources/cohorts/carts shape `analytics` expects, flip
+    `connected: true`.
+
+---
+
+## Phase 4 — done (partial)
+
+Phase 4 UX polish landed in a single commit — the biggest items are shipped
+(deep links + keyboard access). Smaller polish is noted below.
+
+| ID | Status | Commit |
+|---|---|---|
+| ORD-02 deep links (/orders/:id, /customers/:id, /products/:id, /returns/:id, /journal/:id) | fixed | `4d5f12f` |
+| A11Y-01 keyboard-navigable rows | fixed | `4d5f12f` |
+| `/price-ranges` URL alias | fixed | `4d5f12f` |
+| View store link uses Settings site | fixed | `4d5f12f` |
+| Dashboard chart follows the Today / 7 / 30 toggle | fixed | `4d5f12f` |
+| Latest orders row shows date + time | fixed | `4d5f12f` |
+| COD-to-collect grammar (`1 order` / `2 orders`) | fixed earlier | `e0e08d5` (Phase 1 LOGIC-01) |
+
+### Not implemented in Phase 4 (deferred — low impact)
+
+- **Return reasons per product type** — storefront concern (that's where the
+  customer picks a reason). The admin shows reason verbatim. Add the enum
+  list + per-category filter when the storefront is in scope.
+- **Sidebar badge = tab count parity** — the current badges read live counts
+  via `queue()`; the Orders page's Open tab filter uses a slightly different
+  predicate. Auditable, but no evidence of mismatch after Phase 2's CUS-03
+  null-safe fixes. Leaving as-is.
+- **"Failed deliveries" dashboard link target** — the dashboard notification
+  already points at `/orders`; the Delivery failed tab is one click deeper.
+  Could be smarter (`/orders#ndr`) but that depends on persisted tab state.
+- **Badges refresh every 60s** — current behaviour refreshes on navigation
+  only. Add a 60s poll when `/dashboard/summary` migration lands.
+
+---
+
+## Commit summary
+
+Branch `qa-fixes-nov26` on **both** repos.
+
+- Backend: 37 commits (SEC, TAX, LOGIC, VAL, LEGAL, CPN, RET, INV, AUD, CAT,
+  CONT, DATA, IMG, PERF, SHIP, plus 3 phase reports)
+- Admin: 22 commits
+- 7 dry-run scripts in `backend/scripts/`
+- 0 pushed to origin (per the branch strategy you picked)
+
+To push:
+```
+cd backend && git push -u origin qa-fixes-nov26
+cd gnanrudh-admin && git push -u origin qa-fixes-nov26
+```
+
+## QA suite
+
+Not yet run against staging because no staging URL exists. Spin one up with
+these steps and I'll run `tests/api/security.spec.ts` + `business-rules.spec.ts`:
+
+1. Duplicate the backend Vercel project (`gnanrudh-backend-staging`).
+2. Point `MONGO_URI` at a fresh Atlas database.
+3. Seed: `MONGO_URI=... node src/seed.js` on the backend.
+4. Set `ADMIN_URL`, `API_URL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` in `gnanrudh-qa/.env`.
+5. `cd gnanrudh-qa && npm i && npm run test:api`.
+
+---
