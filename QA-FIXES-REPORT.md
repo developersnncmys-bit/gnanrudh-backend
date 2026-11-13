@@ -122,6 +122,79 @@ Say the word and I'll set either up.
 
 ---
 
-## Phase 2, 3, 4
+## Phase 2 — done
+
+Every Phase 2 issue ID has shipped. Admin build and backend syntax are clean.
+
+| ID | Status | Backend commits | Admin commits | Script |
+|---|---|---|---|---|
+| INV-01 / AUD-01 | fixed | `f177b92` (joint) | — | — |
+| INV-02 | fixed | `99bb920` | `6a1e5f7` | — |
+| CUS-03 | fixed | — | `1ecf227` | — |
+| CAT-05 | fixed | `28d7dae` | `0531312` | — |
+| CAT-06 | fixed | — | `7ef4115` | — |
+| CAT-04 | fixed | `cdf336a` | `e8803dc` | — |
+| CAT-01/02/03/07 | fixed | — | `3284aea` | — |
+| CONT-01 | fixed | `3dca5cf` | `f2a59cc` | — |
+| DATA-04 / CUS-01 | fixed | `1a28942` | — | `scripts/recompute-crm.js` |
+| DATA-03 / REV-01 | fixed | `b06390a` | `18642da` | — |
+| IMG-01 | fixed — needs CLOUDINARY_URL env | `1e48276` | — | — |
+
+### What Phase 2 changes operationally
+
+1. **Orders never oversell.** Payment confirm now reserves pieces atomically
+   (`findOneAndUpdate`). If a variant is sold out, the request fails 409 and
+   the payment is not marked paid — the brief's "200 racers on last piece,
+   exactly 1 winner" invariant now holds.
+2. **Stock is single-sourced.** `variant.stock` is derived from Piece rows.
+   The admin form shows it read-only; incoming writes have the field stripped
+   server-side. New stock enters only through "Receive stock" on each variant,
+   which calls `/api/pieces/receive` and creates barcoded pieces.
+3. **Admin never crashes on stale references.** Order, return and customer
+   drawers render soft "not found" panels when a referenced product, customer
+   or order was deleted, instead of throwing.
+4. **CRM figures are live.** `recomputeCustomer(cid)` runs after every event
+   that changes payment state — confirm-payment, cancel, refund, return-refund.
+   LTV uses the Paid / COD-collected rule from LOGIC-01.
+5. **Reviews require a delivered purchase.** New reviews must carry `oid`,
+   that order must belong to the reviewer and be in status `Delivered`, and
+   the product must appear in its items. The old 12 drive-by reviews stay as
+   `verified: false` and are flagged in the moderation UI.
+6. **Uploads go to Cloudinary in production.** When `CLOUDINARY_URL` is set,
+   `/api/uploads` streams the file to Cloudinary and returns the `secure_url`.
+   No env var → disk (dev). `imageUrls` schema validator blocks any non-https
+   URL from being saved, so stale `http://localhost:4000/uploads/...` values
+   cannot land.
+
+### Extra things you still owe me (adds to Phase 1 list)
+
+7. **Cloudinary account + env var (IMG-01)** — sign up at cloudinary.com,
+   copy the Environment variable string (`CLOUDINARY_URL=cloudinary://...`),
+   set it on the backend Vercel project. Rebuild. Existing broken images
+   remain broken — they were `localhost:4000/...` URLs that never resolved.
+   Upload fresh ones through the product form once CLOUDINARY_URL is live.
+8. **Recompute historical CRM (DATA-04)** — one dry-run, then one apply:
+   ```
+   MONGO_URI=... node scripts/recompute-crm.js
+   MONGO_URI=... node scripts/recompute-crm.js --apply
+   ```
+
+### Dry-run scripts added in Phase 2
+
+- `scripts/recompute-crm.js` — scans and optionally rewrites every customer's
+  LTV / orderCount / lastOrder / segment using the new rule.
+
+### Known gaps carried into Phase 3
+
+- **Storefront "hide empty categories"** (CAT-05) is only flagged in the admin
+  today. The storefront repo isn't in this workspace — add the same filter in
+  its category index query when you have it.
+- **Journal "views"** (CONT-01) currently come from a seed field and no code
+  increments them. Phase 3 (DATA-01/02) will wire real analytics or hide the
+  number.
+
+---
+
+## Phase 3, 4
 
 Pending. Will append here as each lands.
