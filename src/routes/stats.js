@@ -31,13 +31,15 @@ statsRouter.get('/dashboard', asyncHandler(async (req, res) => {
   const curStart = new Date(now.getTime() - range * 864e5);
   const prevStart = new Date(now.getTime() - 2 * range * 864e5);
 
+  // LOGIC-01: "Payments received" = money actually in the account.
+  // Prepaid 'Paid' + COD 'COD collected'. Excludes COD pending (with courier),
+  // COD not collected (RTO), Razorpay-webhook-pending and Refunded.
   const match = (from, to) => ({
-    status: { $nin: ['Cancelled', 'Payment pending'] },
-    'payment.status': { $ne: 'Refunded' },
+    'payment.status': { $in: ['Paid', 'COD collected'] },
     placed: { $gte: from.toISOString(), $lt: to.toISOString() },
   });
 
-  const [cur, prev] = await Promise.all([
+  const [cur, prev, codPending] = await Promise.all([
     Order.aggregate([
       { $match: match(curStart, now) },
       { $group: { _id: null, revenue: { $sum: '$total' }, count: { $sum: 1 }, cod: { $sum: { $cond: [{ $eq: ['$payment.method', 'Cash on delivery'] }, 1, 0] } } } },
@@ -45,6 +47,11 @@ statsRouter.get('/dashboard', asyncHandler(async (req, res) => {
     Order.aggregate([
       { $match: match(prevStart, curStart) },
       { $group: { _id: null, revenue: { $sum: '$total' }, count: { $sum: 1 } } },
+    ]),
+    // COD cash still with the courier, across all time (a liability counter, not period-scoped).
+    Order.aggregate([
+      { $match: { 'payment.status': 'COD pending' } },
+      { $group: { _id: null, amount: { $sum: '$total' }, count: { $sum: 1 } } },
     ]),
   ]);
 
@@ -57,6 +64,7 @@ statsRouter.get('/dashboard', asyncHandler(async (req, res) => {
     range,
     current: cur[0] || { revenue: 0, count: 0, cod: 0 },
     previous: prev[0] || { revenue: 0, count: 0 },
+    codToCollect: codPending[0] || { amount: 0, count: 0 },
     repeatCustomers: repeaters,
     totalBuyers: buyers,
   });
@@ -67,7 +75,7 @@ statsRouter.get('/sales-by-category', asyncHandler(async (req, res) => {
   const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
   const since = new Date(Date.now() - days * 864e5).toISOString();
   const rows = await Order.aggregate([
-    { $match: { status: { $nin: ['Cancelled', 'Payment pending'] }, 'payment.status': { $ne: 'Refunded' }, placed: { $gte: since } } },
+    { $match: { 'payment.status': { $in: ['Paid', 'COD collected'] }, placed: { $gte: since } } },
     { $unwind: '$items' },
     { $lookup: { from: 'products', localField: 'items.pid', foreignField: '_id', as: 'product' } },
     { $unwind: '$product' },
@@ -82,7 +90,7 @@ statsRouter.get('/revenue-series', asyncHandler(async (req, res) => {
   const days = Math.max(7, Math.min(90, Number(req.query.days) || 30));
   const since = new Date(Date.now() - days * 864e5).toISOString();
   const series = await Order.aggregate([
-    { $match: { status: { $nin: ['Cancelled', 'Payment pending'] }, 'payment.status': { $ne: 'Refunded' }, placed: { $gte: since } } },
+    { $match: { 'payment.status': { $in: ['Paid', 'COD collected'] }, placed: { $gte: since } } },
     { $group: { _id: { $substr: ['$placed', 0, 10] }, value: { $sum: '$total' } } },
     { $sort: { _id: 1 } },
   ]);
