@@ -23,6 +23,13 @@ const ProductSchema = new mongoose.Schema({
   fabric: String,
   zari: { type: String, default: null },
   border: { type: String, default: null },
+  // CAT-04: occasions is the canonical multi-value field. `occasion` (singular) is kept
+  // as a mirror of occasions[0] for backwards compatibility with storefront/admin reads.
+  occasions: {
+    type: [String],
+    default: [],
+    validate: { validator: (v) => Array.isArray(v) && v.length > 0, message: 'At least one occasion is required.' },
+  },
   occasion: String,
   length: { type: String, default: null },
   width: { type: String, default: null },
@@ -50,6 +57,12 @@ const ProductSchema = new mongoose.Schema({
 // in routes/products.js normalises those too.
 ProductSchema.pre('save', function normaliseWeave(next) {
   if (this.isModified('weave')) this.weave = normaliseWeaveSpelling(this.weave);
+  // CAT-04: keep `occasion` (legacy singular) in sync with occasions[0]. If only the
+  // legacy field was written, wrap it into occasions so the required-validator passes.
+  if (this.isModified('occasion') && (!this.occasions || this.occasions.length === 0) && this.occasion) {
+    this.occasions = [this.occasion];
+  }
+  if (this.occasions && this.occasions.length) this.occasion = this.occasions[0];
   next();
 });
 
