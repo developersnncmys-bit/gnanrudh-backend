@@ -7,7 +7,16 @@ const ShipEventSchema = new mongoose.Schema({
   at: { type: String, index: true },
   courier: String,
   awb: String,
-  webhook: { type: String, default: 'Received' },
+  // SHIP-01 webhook state:
+  //  'Received' — delivered by the courier's system, nothing else to do
+  //  'Retrying' — we failed to confirm; next attempt at `webhookNextAt`
+  //  'Failed'   — attempts exhausted; a human needs to look
+  webhook: { type: String, default: 'Received', enum: ['Received', 'Retrying', 'Failed'] },
+  webhookAttempts: { type: Number, default: 0 },
+  webhookNextAt: { type: String, default: null, index: true },
+  webhookLastErr: { type: String, default: null },
+  // Shiprocket's event id; unique so a replayed webhook doesn't duplicate state.
+  webhookEventId: { type: String, default: null, unique: true, sparse: true },
   detail: { type: String, default: null },
 }, { _id: false });
 
