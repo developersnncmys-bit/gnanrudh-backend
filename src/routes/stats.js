@@ -24,12 +24,22 @@ statsRouter.get('/queue', asyncHandler(async (req, res) => {
   res.json({ pending, ndr, retReview, retRefund, reviews, drafts, webhook, oos });
 }));
 
+// LOGIC-02: anchor period boundaries to IST (Asia/Kolkata) calendar days.
+// Vercel runs in UTC; without this, a "7 days" range ending at 02:00 IST would include
+// today's early hours but drop evenings from the oldest day.
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+const istMidnightDaysAgo = (n) => {
+  const istMs = Date.now() + IST_OFFSET_MS;
+  const istMidnightTodayMs = Math.floor(istMs / 864e5) * 864e5;
+  return new Date(istMidnightTodayMs - n * 864e5 - IST_OFFSET_MS);
+};
+
 // GET /stats/dashboard?range=7 — totals + comparisons for the dashboard KPIs
 statsRouter.get('/dashboard', asyncHandler(async (req, res) => {
   const range = Math.max(1, Math.min(90, Number(req.query.range) || 7));
   const now = new Date();
-  const curStart = new Date(now.getTime() - range * 864e5);
-  const prevStart = new Date(now.getTime() - 2 * range * 864e5);
+  const curStart = istMidnightDaysAgo(range);
+  const prevStart = istMidnightDaysAgo(2 * range);
 
   // LOGIC-01: "Payments received" = money actually in the account.
   // Prepaid 'Paid' + COD 'COD collected'. Excludes COD pending (with courier),
@@ -73,7 +83,7 @@ statsRouter.get('/dashboard', asyncHandler(async (req, res) => {
 // GET /stats/sales-by-category?days=30
 statsRouter.get('/sales-by-category', asyncHandler(async (req, res) => {
   const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
-  const since = new Date(Date.now() - days * 864e5).toISOString();
+  const since = istMidnightDaysAgo(days).toISOString();
   const rows = await Order.aggregate([
     { $match: { 'payment.status': { $in: ['Paid', 'COD collected'] }, placed: { $gte: since } } },
     { $unwind: '$items' },
@@ -88,7 +98,7 @@ statsRouter.get('/sales-by-category', asyncHandler(async (req, res) => {
 // GET /stats/revenue-series?days=30&group=silk,cotton
 statsRouter.get('/revenue-series', asyncHandler(async (req, res) => {
   const days = Math.max(7, Math.min(90, Number(req.query.days) || 30));
-  const since = new Date(Date.now() - days * 864e5).toISOString();
+  const since = istMidnightDaysAgo(days).toISOString();
   const series = await Order.aggregate([
     { $match: { 'payment.status': { $in: ['Paid', 'COD collected'] }, placed: { $gte: since } } },
     { $group: { _id: { $substr: ['$placed', 0, 10] }, value: { $sum: '$total' } } },
