@@ -4,6 +4,10 @@ const ReviewSchema = new mongoose.Schema({
   _id: { type: String, required: true },
   pid: { type: String, index: true },
   cid: { type: String, index: true },
+  // DATA-03/REV-01: order the review is attached to. Required for new reviews so we
+  // can show "Verified buyer" and block drive-by ratings. Legacy rows carry null.
+  oid: { type: String, default: null, index: true },
+  verified: { type: Boolean, default: false, index: true },
   rating: { type: Number, min: 1, max: 5 },
   text: String,
   at: String,

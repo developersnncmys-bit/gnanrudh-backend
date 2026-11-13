@@ -47,8 +47,12 @@ const ProductSchema = new mongoose.Schema({
   status: { type: String, enum: ['Active', 'Draft', 'Hidden'], default: 'Draft', index: true },
   views: { type: Number, default: 0 },
   carts: { type: Number, default: 0 },
+  // DATA-03/REV-01: rating is now a number (1..5 average) recomputed from Published reviews.
+  // Field kept as String in Mongoose for backwards compat with existing seed data that
+  // stored "4.6" as a string; getter normalises on read.
   rating: { type: String, default: '0' },
   reviews: { type: Number, default: 0 },
+  verifiedReviews: { type: Number, default: 0 },
   created: String,
 }, { timestamps: true, _id: false });
 
