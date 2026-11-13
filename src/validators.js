@@ -40,6 +40,21 @@ export const compareAtValidator = function validate(v) {
 const PLACEHOLDER_GSTIN = '29ABCDE1234F1Z5';
 const PLACEHOLDER_ADDR_RE = /^Bengaluru,?\s*Karnataka\s*\d{6}$/i;
 
+// CAT-05: canonical spellings for weaves. Keeps the catalogue filterable even
+// when staff type "Kanjeevaram" or "Kanchipuram" instead of "Kanjivaram".
+const SPELLING_NORMALISE = [
+  [/\b(kanjeev[ae]ram|kanch[ei]puram|kanjivarm)\b/i, 'Kanjivaram'],
+  [/\bbanarsi\b/i, 'Banarasi'],
+  [/\bchand[ae]ri\b/i, 'Chanderi'],
+];
+
+export function normaliseWeaveSpelling(w) {
+  if (!w || typeof w !== 'string') return w;
+  let out = w.trim();
+  for (const [re, canon] of SPELLING_NORMALISE) out = out.replace(re, canon);
+  return out;
+}
+
 export function settingsReady(data) {
   const store = data?.store || {};
   const gst = data?.gst || {};

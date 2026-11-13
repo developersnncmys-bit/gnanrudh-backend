@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { Product } from '../models/Product.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
+import { normaliseWeaveSpelling } from '../validators.js';
 
 const base = crudRouter(Product, {
   searchFields: ['name', 'weave', 'variants.sku', 'variants.colour'],
@@ -13,9 +14,13 @@ export const productsRouter = Router();
 
 // INV-02: variant.stock is derived from Piece documents and is NOT writable through
 // the product API. Any incoming write that tries to set it is quietly dropped.
+// CAT-05: fold common weave misspellings into the canonical name on every write path.
 productsRouter.use((req, res, next) => {
-  if (['POST', 'PUT', 'PATCH'].includes(req.method) && Array.isArray(req.body?.variants)) {
-    req.body.variants = req.body.variants.map((v) => { const { stock, ...rest } = v; return rest; });
+  if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) {
+    if (Array.isArray(req.body.variants)) {
+      req.body.variants = req.body.variants.map((v) => { const { stock, ...rest } = v; return rest; });
+    }
+    if (typeof req.body.weave === 'string') req.body.weave = normaliseWeaveSpelling(req.body.weave);
   }
   next();
 });

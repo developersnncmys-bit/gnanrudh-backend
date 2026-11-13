@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { positivePriceValidator, compareAtValidator } from '../validators.js';
+import { positivePriceValidator, compareAtValidator, normaliseWeaveSpelling } from '../validators.js';
 
 const VariantSchema = new mongoose.Schema({
   id: String,
@@ -44,5 +44,13 @@ const ProductSchema = new mongoose.Schema({
   reviews: { type: Number, default: 0 },
   created: String,
 }, { timestamps: true, _id: false });
+
+// CAT-05: fold common weave misspellings to the canonical name before any save.
+// Covers Mongoose doc.save(). findOneAndUpdate bypasses this — the shared middleware
+// in routes/products.js normalises those too.
+ProductSchema.pre('save', function normaliseWeave(next) {
+  if (this.isModified('weave')) this.weave = normaliseWeaveSpelling(this.weave);
+  next();
+});
 
 export const Product = mongoose.model('Product', ProductSchema);
