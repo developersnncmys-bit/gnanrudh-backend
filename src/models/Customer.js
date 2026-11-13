@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { optMobileValidator, optEmailValidator } from '../validators.js';
 
 const ProfileSchema = new mongoose.Schema({
   who: String,
@@ -18,8 +19,8 @@ const CustomerSchema = new mongoose.Schema({
   city: String,
   state: String,
   pinPrefix: String,
-  phone: { type: String, index: true },
-  email: { type: String, index: true },
+  phone: { type: String, index: true, validate: optMobileValidator },
+  email: { type: String, index: true, validate: optEmailValidator },
   addresses: { type: Number, default: 1 },
   profiles: { type: [ProfileSchema], default: [] },
   notes: { type: [NoteSchema], default: [] },

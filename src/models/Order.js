@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { optPincodeValidator } from '../validators.js';
 
 const OrderItemSchema = new mongoose.Schema({
   pid: String,
@@ -20,7 +21,7 @@ const ShipSchema = new mongoose.Schema({
   weight: Number,
   slab: String,
   rate: Number,
-  pin: String,
+  pin: { type: String, validate: optPincodeValidator },
   etd: String,
 }, { _id: false });
 

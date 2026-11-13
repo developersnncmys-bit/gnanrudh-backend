@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { positivePriceValidator, compareAtValidator } from '../validators.js';
 
 const VariantSchema = new mongoose.Schema({
   id: String,
@@ -14,8 +15,8 @@ const ProductSchema = new mongoose.Schema({
   cat: { type: String, required: true, index: true },
   weave: String,
   name: { type: String, required: true },
-  price: { type: Number, required: true },
-  compareAt: { type: Number, default: null },
+  price: { type: Number, required: true, validate: positivePriceValidator },
+  compareAt: { type: Number, default: null, validate: { validator: compareAtValidator, message: 'Compare-at price must be greater than price.' } },
   variants: { type: [VariantSchema], default: [] },
   hex: String,
   zariHex: String,
