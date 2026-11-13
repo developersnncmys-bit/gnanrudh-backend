@@ -19,6 +19,54 @@ const base = crudRouter(Return, {
 
 export const returnsRouter = Router();
 
+// RET-01/02: look up the return window from Settings.policy.window, default 7.
+async function getReturnWindowDays() {
+  const s = await Singleton.findById('settings').lean();
+  const w = Number(s?.data?.policy?.window);
+  return Number.isFinite(w) && w > 0 ? w : 7;
+}
+
+// RET-01: pre-flight eligibility check. Returns { eligible, daysSinceDelivery, windowDays, deliveredAt }.
+export async function checkReturnEligibility(oid) {
+  const o = await Order.findById(oid).lean();
+  if (!o) return { eligible: false, reason: 'Order not found' };
+  const windowDays = await getReturnWindowDays();
+  if (!o.deliveredAt) return { eligible: false, deliveredAt: null, windowDays, reason: 'Order not delivered yet' };
+  const diffDays = Math.floor((Date.now() - new Date(o.deliveredAt).getTime()) / 864e5);
+  return { eligible: diffDays <= windowDays, deliveredAt: o.deliveredAt, daysSinceDelivery: diffDays, windowDays };
+}
+
+// RET-01: custom POST overrides the generic crud.create so we can snapshot
+// deliveredAt and apply eligibility before the Return hits the DB.
+returnsRouter.post('/', asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  if (!body.oid) return res.status(400).json({ error: 'oid is required' });
+  const o = await Order.findById(body.oid).lean();
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  const windowDays = await getReturnWindowDays();
+  const deliveredAt = o.deliveredAt || null;
+  const daysSinceDelivery = deliveredAt ? Math.floor((Date.now() - new Date(deliveredAt).getTime()) / 864e5) : null;
+  const eligible = deliveredAt != null && daysSinceDelivery <= windowDays;
+  const status = body.status || (eligible ? 'Requested' : 'Not eligible');
+  const doc = await Return.create({
+    ...body,
+    status,
+    deliveredAt,
+    windowDays,
+  });
+  res.status(201).json(doc.toObject());
+}));
+
+// RET-02: reverse pickups with no status change for >=5 days are flagged for action.
+returnsRouter.get('/overdue-pickups', asyncHandler(async (req, res) => {
+  const cutoff = new Date(Date.now() - 5 * 864e5);
+  const items = await Return.find({
+    status: 'Pickup scheduled',
+    updatedAt: { $lte: cutoff },
+  }).sort({ updatedAt: 1 }).lean();
+  res.json({ items, total: items.length });
+}));
+
 returnsRouter.post('/:id/approve', asyncHandler(async (req, res) => {
   const r = await Return.findById(req.params.id);
   if (!r) return res.status(404).json({ error: 'Return not found' });
@@ -66,6 +114,15 @@ returnsRouter.post('/:id/refund', asyncHandler(async (req, res) => {
   const settings = await Singleton.findById('settings').lean();
   const ready = settingsReady(settings?.data);
   if (!ready.ok) return res.status(409).json({ error: 'Seller details on Settings are not complete; cannot issue credit note', issues: ready.issues });
+
+  // RET-03: refund amount can never exceed the line value on the original order.
+  const srcOrder = await Order.findById(r.oid).lean();
+  const srcLine = srcOrder?.items?.find((it) => it.pid === r.pid);
+  const lineCap = srcLine ? srcLine.price * (srcLine.qty || 1) : Infinity;
+  const amount = Number(req.body?.amount ?? r.amount);
+  if (!(amount > 0)) return res.status(400).json({ error: 'Refund amount must be greater than zero' });
+  if (amount > lineCap) return res.status(400).json({ error: `Refund amount ${amount} exceeds the line value ${lineCap}` });
+  r.amount = amount;
 
   r.status = 'Refunded';
   await r.save();

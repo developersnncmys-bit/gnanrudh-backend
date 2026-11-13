@@ -43,6 +43,9 @@ const OrderSchema = new mongoose.Schema({
   ndr: { type: String, default: null },
   source: String,
   promised: String,
+  // RET-01: set when Shiprocket's Delivered webhook lands (or manual "mark delivered").
+  // Returns compute eligibility from this + Settings.policy.window.
+  deliveredAt: { type: String, default: null },
 }, { timestamps: true, _id: false });
 
 export const Order = mongoose.model('Order', OrderSchema);
