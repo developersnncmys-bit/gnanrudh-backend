@@ -79,4 +79,7 @@ ProductSchema.pre('save', function normaliseWeave(next) {
   next();
 });
 
+// PERF-01: compound indexes for catalogue filter + storefront queries.
+ProductSchema.index({ status: 1, cat: 1, price: 1 });
+
 export const Product = mongoose.model('Product', ProductSchema);

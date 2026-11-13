@@ -19,4 +19,7 @@ const PieceSchema = new mongoose.Schema({
   printed: { type: Boolean, default: false },
 }, { timestamps: true, _id: false });
 
+// PERF-01: compound indexes for the hot reservation + packing queries.
+PieceSchema.index({ vid: 1, status: 1 });
+
 export const Piece = mongoose.model('Piece', PieceSchema);

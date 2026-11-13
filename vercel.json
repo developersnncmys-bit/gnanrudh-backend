@@ -2,5 +2,11 @@
   "version": 2,
   "rewrites": [
     { "source": "/(.*)", "destination": "/api" }
-  ]
+  ],
+  "regions": ["bom1"],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 15
+    }
+  }
 }

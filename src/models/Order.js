@@ -48,4 +48,8 @@ const OrderSchema = new mongoose.Schema({
   deliveredAt: { type: String, default: null },
 }, { timestamps: true, _id: false });
 
+// PERF-01: compound indexes for the hot dashboard + listing queries.
+OrderSchema.index({ status: 1, placed: -1 });
+OrderSchema.index({ invoice: 1 }, { unique: true, sparse: true });
+
 export const Order = mongoose.model('Order', OrderSchema);

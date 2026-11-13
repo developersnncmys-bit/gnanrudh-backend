@@ -22,4 +22,7 @@ ShipEventSchema.post('save', async function postSave(doc) {
   } catch (e) { /* non-fatal: next event will retry */ }
 });
 
+// PERF-01: compound index for order shipping timeline queries.
+ShipEventSchema.index({ oid: 1, at: -1 });
+
 export const ShipEvent = mongoose.model('ShipEvent', ShipEventSchema);

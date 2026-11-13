@@ -20,4 +20,7 @@ const ReturnSchema = new mongoose.Schema({
   photos: { type: [String], default: [] },
 }, { timestamps: true, _id: false });
 
+// PERF-01: compound index for status queue + chronological scan.
+ReturnSchema.index({ status: 1, requested: -1 });
+
 export const Return = mongoose.model('Return', ReturnSchema);
