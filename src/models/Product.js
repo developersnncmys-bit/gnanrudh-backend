@@ -39,7 +39,16 @@ const ProductSchema = new mongoose.Schema({
   modelHeight: { type: String, default: null },
   drapeStyle: { type: String, default: null },
   images: { type: Number, default: 0 },
-  imageUrls: { type: [String], default: [] },
+  // IMG-01: every URL in imageUrls must be absolute https (or an empty string during
+  // transition). Blocks the old `localhost:4000/uploads/...` relics from being written.
+  imageUrls: {
+    type: [String],
+    default: [],
+    validate: {
+      validator: (arr) => Array.isArray(arr) && arr.every((u) => !u || /^https:\/\//i.test(u)),
+      message: 'imageUrls must be absolute https URLs.',
+    },
+  },
   video: { type: Boolean, default: false },
   videoName: { type: String, default: '' },
   hsn: String,
