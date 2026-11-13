@@ -3,11 +3,11 @@ import { Return } from '../models/Return.js';
 import { Order } from '../models/Order.js';
 import { Product } from '../models/Product.js';
 import { ShipEvent } from '../models/ShipEvent.js';
-import { Singleton } from '../models/Singleton.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { Piece } from '../models/Piece.js';
 import { Movement } from '../models/Movement.js';
+import { nextCnNo, formatCreditNote } from '../invoicing.js';
 
 const base = crudRouter(Return, {
   searchFields: ['_id', 'oid', 'reason'],
@@ -64,16 +64,12 @@ returnsRouter.post('/:id/refund', asyncHandler(async (req, res) => {
   r.status = 'Refunded';
   await r.save();
 
-  const d = await Singleton.findByIdAndUpdate(
-    'counters',
-    { $inc: { 'data.cnSeq': 1 }, $setOnInsert: { _id: 'counters' } },
-    { new: true, upsert: true, setDefaultsOnInsert: true },
-  ).lean();
-  const seq = d.data.cnSeq;
+  const now = new Date();
+  const seq = await nextCnNo(now);
 
   const o = await Order.findById(r.oid);
   if (o) {
-    o.creditNote = `GR-CN/26-27/${String(seq).padStart(4, '0')}`;
+    o.creditNote = formatCreditNote(now, seq);
     o.payment.status = 'Refunded';
     await o.save();
   }

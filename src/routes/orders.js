@@ -6,6 +6,7 @@ import { Singleton } from '../models/Singleton.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { reservePiecesForOrder, releasePiecesForOrder } from './pieces.js';
+import { nextInvoiceNo, nextCnNo, formatInvoice, formatCreditNote } from '../invoicing.js';
 
 const base = crudRouter(Order, {
   searchFields: ['_id', 'ship.awb', 'payment.rzp'],
@@ -14,23 +15,6 @@ const base = crudRouter(Order, {
 });
 
 export const ordersRouter = Router();
-
-async function nextInvoiceNo() {
-  const d = await Singleton.findByIdAndUpdate(
-    'counters',
-    { $inc: { 'data.invSeq': 1 }, $setOnInsert: { _id: 'counters' } },
-    { new: true, upsert: true, setDefaultsOnInsert: true },
-  ).lean();
-  return d.data.invSeq;
-}
-async function nextCnNo() {
-  const d = await Singleton.findByIdAndUpdate(
-    'counters',
-    { $inc: { 'data.cnSeq': 1 }, $setOnInsert: { _id: 'counters' } },
-    { new: true, upsert: true, setDefaultsOnInsert: true },
-  ).lean();
-  return d.data.cnSeq;
-}
 
 async function logShip(order, type, extra = {}) {
   const ev = await ShipEvent.create({
@@ -56,8 +40,8 @@ ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
   o.ship.courier = o.ship.courier || 'Delhivery';
   o.ship.awb = o.ship.awb || `${Math.floor(10000000 + Math.random() * 89999999)}11`;
   if (!o.invoice) {
-    const seq = await nextInvoiceNo();
-    o.invoice = `GR/26-27/${String(seq).padStart(4, '0')}`;
+    const now = new Date();
+    o.invoice = formatInvoice(now, await nextInvoiceNo(now));
   }
   await o.save();
   await logShip(o, 'Order pushed');
@@ -119,8 +103,8 @@ ordersRouter.post('/:id/refund', asyncHandler(async (req, res) => {
   const amt = Number(amount);
   if (!(amt > 0 && amt <= o.total)) return res.status(400).json({ error: `Amount must be between 1 and ${o.total}` });
   o.payment.status = 'Refunded';
-  const seq = await nextCnNo();
-  o.creditNote = `GR-CN/26-27/${String(seq).padStart(4, '0')}`;
+  const now = new Date();
+  o.creditNote = formatCreditNote(now, await nextCnNo(now));
   await o.save();
   res.json(o.toObject());
 }));
