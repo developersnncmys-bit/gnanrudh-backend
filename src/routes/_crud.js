@@ -16,10 +16,33 @@ import { asyncHandler } from '../middleware/asyncHandler.js';
  *   defaultSort:  object   — default sort when none given
  *   limitDefault: number   — default page size (0 = no limit)
  */
+// PERF-03/04 pagination constants. Default page size is 50; hard cap at 100.
+// `limit=0` used to mean "everything" and the bootstrap used it on every list; now
+// the server clamps and returns at most PAGE_MAX rows per request.
+const PAGE_DEFAULT = 50;
+const PAGE_MAX = 100;
+
+export function parsePaging(query) {
+  let limit = Number(query.limit);
+  if (!Number.isFinite(limit) || limit <= 0) limit = PAGE_DEFAULT;
+  if (limit > PAGE_MAX) limit = PAGE_MAX;
+  let skip = 0;
+  if (query.skip !== undefined) {
+    const s = Number(query.skip);
+    if (Number.isFinite(s) && s >= 0) skip = Math.floor(s);
+  } else if (query.page !== undefined) {
+    const p = Number(query.page);
+    if (Number.isFinite(p) && p >= 1) skip = (Math.floor(p) - 1) * limit;
+  }
+  return { limit, skip };
+}
+
 export function crudRouter(Model, {
   searchFields = [],
   filterKeys = [],
   defaultSort = { createdAt: -1 },
+  // limitDefault is kept for signature compatibility but ignored — PERF-03 caps everyone at PAGE_MAX.
+  // eslint-disable-next-line no-unused-vars
   limitDefault = 0,
 } = {}) {
   const router = Router();
@@ -40,13 +63,12 @@ export function crudRouter(Model, {
     // sort key is a model field name; strip any dotted or $ keys to kill prototype/operator abuse.
     const sortKey = typeof req.query.sort === 'string' ? req.query.sort.replace(/[.$]/g, '') : '';
     const sort = sortKey ? { [sortKey]: req.query.dir === 'asc' ? 1 : -1 } : defaultSort;
-    const limit = req.query.limit !== undefined ? Number(req.query.limit) : limitDefault;
-    const skip = Number(req.query.skip) || 0;
+    const { limit, skip } = parsePaging(req.query);
     const [items, total] = await Promise.all([
-      Model.find(filter).sort(sort).skip(skip).limit(limit > 0 ? limit : 0).lean(),
+      Model.find(filter).sort(sort).skip(skip).limit(limit).lean(),
       Model.countDocuments(filter),
     ]);
-    res.json({ items, total });
+    res.json({ items, total, limit, skip });
   }));
 
   router.get('/:id', asyncHandler(async (req, res) => {

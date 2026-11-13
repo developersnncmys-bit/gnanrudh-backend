@@ -4,6 +4,7 @@ import { Movement } from '../models/Movement.js';
 import { Product } from '../models/Product.js';
 import { Order } from '../models/Order.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
+import { parsePaging } from './_crud.js';
 
 export const piecesRouter = Router();
 export const movementsRouter = Router();
@@ -17,8 +18,13 @@ piecesRouter.get('/', asyncHandler(async (req, res) => {
     if (v === undefined || v === '' || typeof v === 'object') continue;
     filter[k] = String(v);
   }
-  const items = await Piece.find(filter).sort({ at: -1 }).lean();
-  res.json({ items, total: items.length });
+  // PERF-03: pagination. No more "return every piece in one request".
+  const { limit, skip } = parsePaging(req.query);
+  const [items, total] = await Promise.all([
+    Piece.find(filter).sort({ at: -1 }).skip(skip).limit(limit).lean(),
+    Piece.countDocuments(filter),
+  ]);
+  res.json({ items, total, limit, skip });
 }));
 
 piecesRouter.get('/:code', asyncHandler(async (req, res) => {
@@ -28,8 +34,13 @@ piecesRouter.get('/:code', asyncHandler(async (req, res) => {
 }));
 
 movementsRouter.get('/', asyncHandler(async (req, res) => {
-  const items = await Movement.find({}).sort({ at: -1 }).limit(Number(req.query.limit) || 5000).lean();
-  res.json({ items, total: items.length });
+  // PERF-03: paginate movements too (was uncapped hidden behind limit=5000).
+  const { limit, skip } = parsePaging(req.query);
+  const [items, total] = await Promise.all([
+    Movement.find({}).sort({ at: -1 }).skip(skip).limit(limit).lean(),
+    Movement.countDocuments({}),
+  ]);
+  res.json({ items, total, limit, skip });
 }));
 
 /* ---------- helpers ---------- */
