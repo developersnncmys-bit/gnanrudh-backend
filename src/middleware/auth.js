@@ -14,7 +14,7 @@ export function requireAuth(req, res, next) {
   const [scheme, token] = header.split(' ');
   if (scheme !== 'Bearer' || !token) return res.status(401).json({ error: 'Missing bearer token' });
   try {
-    req.user = jwt.verify(token, config.jwtSecret);
+    req.user = jwt.verify(token, config.jwtSecret, { algorithms: ['HS256'] });
     next();
   } catch (err) {
     return res.status(401).json({ error: err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token' });
