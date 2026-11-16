@@ -5,6 +5,7 @@ const CmsPageSchema = new mongoose.Schema({
   desc: String,
   updated: String,
   body: String,
+  banner: String,
 }, { timestamps: true });
 
 export const CmsPage = mongoose.model('CmsPage', CmsPageSchema);

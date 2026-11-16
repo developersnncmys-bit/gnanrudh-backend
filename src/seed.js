@@ -220,6 +220,7 @@ const scenes = [
 ].map(([name, line], i) => ({ order: i, name, line }));
 
 const pages = [
+  ['Home', 'The storefront landing page. Upload a hero banner shown at the top above the homepage story.', 2],
   ['Our house', 'Founder’s story, the weavers and clusters we buy from, and what the house will not stock.', 12],
   ['Contact', 'Map, enquiry form, phone, WhatsApp and email.', 40],
   ['Shipping policy', 'Delivery timelines, charges and COD.', 22],

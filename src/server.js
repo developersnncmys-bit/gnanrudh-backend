@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { pathToFileURL } from 'url';
 import { config } from './config.js';
 import { connectDB } from './db.js';
 import { errorHandler, notFound } from './middleware/asyncHandler.js';
@@ -25,6 +26,7 @@ import { piecesRouter, movementsRouter } from './routes/pieces.js';
 import { authRouter } from './routes/auth.js';
 import { requireAuth } from './middleware/auth.js';
 import { seedPiecesFromStock } from './seedPieces.js';
+import { CmsPage } from './models/CmsPage.js';
 
 const app = express();
 
@@ -77,15 +79,37 @@ app.use(errorHandler);
 
 export default app;
 
+// Insert the "Home" CMS page record for already-running DBs that were seeded
+// before Home existed. Safe to run on every boot — $setOnInsert is a no-op
+// when the record already exists.
+async function ensureHomePage() {
+  await CmsPage.updateOne(
+    { name: 'Home' },
+    {
+      $setOnInsert: {
+        name: 'Home',
+        desc: 'The storefront landing page. Upload a hero banner shown at the top above the homepage story.',
+        updated: new Date().toISOString().slice(0, 10),
+        body: '',
+      },
+    },
+    { upsert: true },
+  );
+}
+
 // Only start a listening HTTP server when run directly (local dev).
 // On Vercel, the file is imported as a serverless function and this block is skipped.
-if (process.env.VERCEL !== '1' && import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}`) {
+// On Windows, import.meta.url is `file:///C:/...` (three slashes) while a
+// hand-rolled `file://${argv[1]}` has two. Use pathToFileURL so the comparison
+// works on both Windows and POSIX.
+if (process.env.VERCEL !== '1' && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   (async () => {
     await connectDB();
     try {
       const r = await seedPiecesFromStock();
       if (!r.skipped) console.log(`[server] seeded ${r.seeded} pieces from existing stock`);
     } catch (e) { console.warn('[server] piece seed failed:', e.message); }
+    try { await ensureHomePage(); } catch (e) { console.warn('[server] home page upsert failed:', e.message); }
     app.listen(config.port, () => {
       console.log(`[server] listening on http://localhost:${config.port}`);
     });
