@@ -283,7 +283,7 @@ async function run() {
   const existingAdmin = await User.findOne({ email: adminEmail });
   if (!existingAdmin) {
     const passwordHash = await bcrypt.hash(config.defaultAdmin.password, 10);
-    await User.create({ email: adminEmail, passwordHash, name: 'Admin', role: 'admin' });
+    await User.create({ email: adminEmail, passwordHash, name: 'Admin', role: 'owner' });
     console.log(`[seed] created admin ${adminEmail} (password: ${config.defaultAdmin.password})`);
   } else {
     console.log(`[seed] admin ${adminEmail} already exists — password unchanged`);
