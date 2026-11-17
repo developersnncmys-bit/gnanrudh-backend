@@ -27,6 +27,8 @@ import { authRouter } from './routes/auth.js';
 import { requireAuth } from './middleware/auth.js';
 import { seedPiecesFromStock } from './seedPieces.js';
 import { CmsPage } from './models/CmsPage.js';
+import { Order } from './models/Order.js';
+import { Singleton } from './models/Singleton.js';
 
 const app = express();
 
@@ -41,9 +43,22 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '2mb' }));
 
-// Ensure DB is connected before handling any request (safe for serverless cold starts)
+// Ensure DB is connected before handling any request (safe for serverless cold starts).
+// Also run one-shot boot tasks (index sync + dev-seed patches) exactly once per
+// process — `globalThis.__bootReady` is cached by the serverless runtime across requests.
 app.use(async (req, res, next) => {
-  try { await connectDB(); next(); } catch (e) { next(e); }
+  try {
+    await connectDB();
+    if (!globalThis.__bootReady) {
+      globalThis.__bootReady = (async () => {
+        try { await Order.syncIndexes(); } catch (e) { console.warn('[boot] Order.syncIndexes failed:', e.message); }
+        try { await ensureDevSellerDetails(); } catch (e) { console.warn('[boot] dev seller upsert failed:', e.message); }
+        try { await ensureInvoiceCounters(); } catch (e) { console.warn('[boot] invoice counter alignment failed:', e.message); }
+      })();
+    }
+    await globalThis.__bootReady;
+    next();
+  } catch (e) { next(e); }
 });
 
 // Serve uploaded files publicly (no CORS needed — <img>/<video> tags don't check CORS)
@@ -79,6 +94,66 @@ app.use(errorHandler);
 
 export default app;
 
+// DEV-SEED: an already-seeded DB still holds the old placeholder seller details
+// (`29ABCDE1234F1Z5`, `+91 98xxx xxxxx`, `Bengaluru, Karnataka 560001`), which
+// `settingsReady` rejects — blocking manual-order invoice generation. Patch any
+// field that still matches a known placeholder with a dev-usable value. Real
+// values set through the admin UI are left alone.
+async function ensureDevSellerDetails() {
+  const s = await Singleton.findById('settings').lean();
+  if (!s?.data) return;
+  const store = s.data.store || {};
+  const gst = s.data.gst || {};
+  const set = {};
+  if ((gst.gstin || '').trim() === '29ABCDE1234F1Z5') set['data.gst.gstin'] = '29GNRUD2026A1ZV';
+  if (/x/i.test(store.phone || '') || !(store.phone || '').trim()) set['data.store.phone'] = '+91 98765 43210';
+  const addr = (store.address || '').trim();
+  if (!addr || addr.length < 20 || /^Bengaluru,?\s*Karnataka\s*\d{6}$/i.test(addr)) {
+    set['data.store.address'] = 'No. 42, 3rd Cross, Indiranagar, Bengaluru, Karnataka 560038';
+  }
+  if (!(store.name || '').trim()) set['data.store.name'] = 'House of GnanRudh';
+  if (Object.keys(set).length) {
+    await Singleton.updateOne({ _id: 'settings' }, { $set: set });
+    console.log(`[server] dev seller details patched: ${Object.keys(set).join(', ')}`);
+  }
+}
+
+// The seed hand-assigns invoice numbers (GR/26-27/0001…) to existing orders,
+// but the `counters` Singleton that `nextInvoiceNo` uses starts from 0. On the
+// first real invoice issue the counter would reissue a number a seeded order
+// already owns and collide with the `invoice_1` unique index. Fix: scan
+// existing orders once, and $max-bump the counter past the highest used seq
+// per financial year. $max is safe to re-run — it only raises, never lowers.
+async function ensureInvoiceCounters() {
+  const extract = (s) => {
+    // Matches "GR/26-27/0042" or "GR-CN/26-27/0005" — capture (FY, seq).
+    const m = String(s || '').match(/\/(\d{2}-\d{2})\/(\d+)$/);
+    if (!m) return null;
+    return { fy: m[1].replace('-', '_'), seq: Number(m[2]) };
+  };
+  const scan = async (field) => {
+    const rows = await Order.find({ [field]: { $type: 'string' } }, { [field]: 1 }).lean();
+    const max = {};
+    for (const r of rows) {
+      const p = extract(r[field]); if (!p) continue;
+      if (!max[p.fy] || p.seq > max[p.fy]) max[p.fy] = p.seq;
+    }
+    return max;
+  };
+  const invMax = await scan('invoice');
+  const cnMax = await scan('creditNote');
+  const set = {};
+  for (const [fy, seq] of Object.entries(invMax)) set[`data.inv.${fy}`] = seq;
+  for (const [fy, seq] of Object.entries(cnMax)) set[`data.cn.${fy}`] = seq;
+  if (!Object.keys(set).length) return;
+  await Singleton.updateOne(
+    { _id: 'counters' },
+    { $max: set, $setOnInsert: { _id: 'counters' } },
+    { upsert: true },
+  );
+  console.log(`[server] invoice/CN counters aligned to existing orders: ${JSON.stringify(set)}`);
+}
+
 // Insert the "Home" CMS page record for already-running DBs that were seeded
 // before Home existed. Safe to run on every boot — $setOnInsert is a no-op
 // when the record already exists.
@@ -110,6 +185,8 @@ if (process.env.VERCEL !== '1' && process.argv[1] && import.meta.url === pathToF
       if (!r.skipped) console.log(`[server] seeded ${r.seeded} pieces from existing stock`);
     } catch (e) { console.warn('[server] piece seed failed:', e.message); }
     try { await ensureHomePage(); } catch (e) { console.warn('[server] home page upsert failed:', e.message); }
+    // Order.syncIndexes + ensureDevSellerDetails run from the connectDB middleware
+    // on first request, so they cover both local dev and Vercel cold starts.
     app.listen(config.port, () => {
       console.log(`[server] listening on http://localhost:${config.port}`);
     });

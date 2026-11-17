@@ -50,6 +50,12 @@ const OrderSchema = new mongoose.Schema({
 
 // PERF-01: compound indexes for the hot dashboard + listing queries.
 OrderSchema.index({ status: 1, placed: -1 });
-OrderSchema.index({ invoice: 1 }, { unique: true, sparse: true });
+// Unique only among orders that actually have an invoice string. A sparse index
+// still indexes `invoice: null` and collides across multiple pending orders;
+// a partial filter skips nulls entirely, which is what we want.
+OrderSchema.index(
+  { invoice: 1 },
+  { unique: true, partialFilterExpression: { invoice: { $type: 'string' } } },
+);
 
 export const Order = mongoose.model('Order', OrderSchema);

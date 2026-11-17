@@ -238,11 +238,16 @@ const pages = [
   return { name, desc, updated: iso(addDays(TODAY, -d)), body };
 });
 
+// DEV-SEED: the seller details below are placeholders chosen so `settingsReady`
+// passes in a dev environment (manual-order invoice generation needs this).
+// They are NOT a real GSTIN / phone / address — replace with real values before
+// using in production. The validator blocks the old `29ABCDE1234F1Z5` literal,
+// so we use a different syntactically-valid GSTIN here.
 const SETTINGS = {
-  store: { name: 'House of GnanRudh', site: 'houseofgnanrudh.com', phone: '+91 98xxx xxxxx', email: 'care@houseofgnanrudh.com', address: 'Bengaluru, Karnataka 560001' },
+  store: { name: 'House of GnanRudh', site: 'houseofgnanrudh.com', phone: '+91 98765 43210', email: 'care@houseofgnanrudh.com', address: 'No. 42, 3rd Cross, Indiranagar, Bengaluru, Karnataka 560038' },
   pay: { methods: { UPI: true, Cards: true, Wallets: true, Netbanking: true, EMI: true }, cod: true, codCap: 25000, codPins: 1842, codFile: '' },
   ship: { packaging: 120, freeAbove: 2999 },
-  gst: { gstin: '29ABCDE1234F1Z5', inv: 'GR/26-27/', cn: 'GR-CN/26-27/' },
+  gst: { gstin: '29GNRUD2026A1ZV', inv: 'GR/26-27/', cn: 'GR-CN/26-27/' },
   account: { email: 'surekha@houseofgnanrudh.com', pwChanged: iso(addDays(TODAY, -64)), devices: [{ name: 'MacBook, Chrome', where: 'Bengaluru' }, { name: 'iPhone, Safari', where: 'Bengaluru' }] },
 };
 
