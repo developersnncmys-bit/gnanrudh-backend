@@ -44,24 +44,54 @@ const diskStorage = multer.diskStorage({
   },
 });
 
-// Cloudinary upload accepts a buffer, so we use memoryStorage there and stream the
-// buffer into cloudinary.uploader.upload_stream.
+// Per-type media size caps. Kept in step with gnanrudh-admin/src/lib/api.js
+// UPLOAD_LIMITS — admin client enforces its own tighter check first; this
+// is the server-side safety net for direct uploads / bypassed clients.
+//   - images: 10 MB  (web product shots don't need more; Cloudinary auto-
+//                     transforms downscale at delivery time anyway)
+//   - videos: 100 MB (drape clips at 720p mp4; multer needs this as its
+//                     single request-level ceiling)
+// Multer only accepts ONE `fileSize` limit per instance, so we set it to
+// the higher of the two and re-check images inside the route handler.
+export const UPLOAD_LIMITS = {
+  image: 10 * 1024 * 1024,
+  video: 100 * 1024 * 1024,
+};
+
 const upload = multer({
   storage: USE_CLOUDINARY ? multer.memoryStorage() : diskStorage,
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB per file
+  limits: { fileSize: UPLOAD_LIMITS.video },
   fileFilter: (req, file, cb) => {
     if (/^(image|video)\//.test(file.mimetype)) cb(null, true);
     else cb(new Error(`Unsupported file type: ${file.mimetype}`));
   },
 });
 
+// Image files that pass multer's video-sized ceiling can still be over the
+// image-specific cap. Checked after multer has parsed so `f.size` is known.
+// Returns the first offender's message, or null when all files are OK.
+function enforceImageCap(files) {
+  for (const f of (files || [])) {
+    if (f.mimetype.startsWith('image/') && f.size > UPLOAD_LIMITS.image) {
+      const mb = (UPLOAD_LIMITS.image / (1024 * 1024)).toFixed(0);
+      const actual = (f.size / (1024 * 1024)).toFixed(1);
+      return `${f.originalname} is ${actual} MB — images must be under ${mb} MB.`;
+    }
+  }
+  return null;
+}
+
 function uploadToCloudinary(file) {
   return new Promise((resolve, reject) => {
-    const kind = file.mimetype.startsWith('video/') ? 'video' : 'image';
-    const stream = cloudinary.uploader.upload_stream(
-      { folder: CLOUDINARY_FOLDER, resource_type: kind },
-      (err, result) => (err ? reject(err) : resolve(result)),
-    );
+    const isVideo = file.mimetype.startsWith('video/');
+    const opts = { folder: CLOUDINARY_FOLDER, resource_type: isVideo ? 'video' : 'image' };
+    const cb = (err, result) => (err ? reject(err) : resolve(result));
+    // Videos stream through `upload_chunked_stream` with 6 MB chunks so
+    // clips in the 20-100 MB range upload reliably instead of timing out
+    // on a single multipart POST to Cloudinary.
+    const stream = isVideo
+      ? cloudinary.uploader.upload_chunked_stream({ ...opts, chunk_size: 6 * 1024 * 1024 }, cb)
+      : cloudinary.uploader.upload_stream(opts, cb);
     stream.end(file.buffer);
   });
 }
@@ -69,8 +99,13 @@ function uploadToCloudinary(file) {
 export const uploadsRouter = Router();
 
 // POST /api/uploads — accepts up to 20 files under the field name "files".
+// multer errors (file too large, unsupported type) surface via `next(err)`
+// and land in the global errorHandler, so the client receives a 500 with
+// a readable message rather than a hang.
 uploadsRouter.post('/', upload.array('files', 20), async (req, res, next) => {
   try {
+    const imgErr = enforceImageCap(req.files);
+    if (imgErr) return res.status(413).json({ error: imgErr });
     if (USE_CLOUDINARY) {
       const uploaded = await Promise.all((req.files || []).map(async (f) => {
         const r = await uploadToCloudinary(f);
@@ -94,6 +129,27 @@ uploadsRouter.post('/', upload.array('files', 20), async (req, res, next) => {
     }));
     res.json({ files });
   } catch (e) { next(e); }
+});
+
+// Route-local error handler — translates multer's size/filter errors into
+// clean 413/415 responses with human-readable messages. Without this they
+// hit the global handler as 500s, and the admin's toast just says
+// "Internal error" with no hint that the file was too large. Must be
+// registered BEFORE the next route (Express error-handler ordering).
+uploadsRouter.use((err, req, res, next) => {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    const mb = (UPLOAD_LIMITS.video / (1024 * 1024)).toFixed(0);
+    return res.status(413).json({
+      error: `File too large. Videos must be under ${mb} MB, images under ${(UPLOAD_LIMITS.image / (1024 * 1024)).toFixed(0)} MB.`,
+    });
+  }
+  if (err && err.code === 'LIMIT_FILE_COUNT') {
+    return res.status(413).json({ error: 'Too many files. Max 20 per upload.' });
+  }
+  if (err && /Unsupported file type/i.test(err.message || '')) {
+    return res.status(415).json({ error: err.message });
+  }
+  return next(err);
 });
 
 // DELETE /api/uploads/:filename — remove an upload (best-effort).

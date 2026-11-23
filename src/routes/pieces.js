@@ -189,12 +189,35 @@ async function reservePiecesForOrder(order, { by = 'System' } = {}) {
       if (existing && existing.oid === order._id && ['Reserved', 'Packed'].includes(existing.status)) continue;
     }
     const at = new Date().toISOString();
-    const claimed = await Piece.findOneAndUpdate(
-      { vid: it.vid, status: 'In stock', oid: null },
-      { $set: { status: 'Reserved', oid: order._id, at } },
-      { new: true, sort: { received: 1 } },
-    );
-    if (!claimed) { shortages.push({ vid: it.vid, qty: it.qty || 1 }); continue; }
+    // Reservation strategy:
+    //   1) If the line carries a vid, claim a piece with that exact vid.
+    //      This is the strict path — honours a shopper's explicit colour
+    //      pick and lets the admin's manual orders target a specific SKU.
+    //   2) If (1) finds nothing (or no vid was sent), fall back to any
+    //      in-stock piece for the same product. The storefront doesn't
+    //      currently force a colour pick before Add-to-Cart, so this
+    //      keeps checkout from bouncing with 409 when there's at least
+    //      one piece of the product available in any colour. When the
+    //      fallback claims a piece we rewrite `it.vid` so downstream
+    //      movement audit + packing lists show the colour that was
+    //      actually reserved.
+    let claimed = null;
+    if (it.vid) {
+      claimed = await Piece.findOneAndUpdate(
+        { vid: it.vid, status: 'In stock', oid: null },
+        { $set: { status: 'Reserved', oid: order._id, at } },
+        { new: true, sort: { received: 1 } },
+      );
+    }
+    if (!claimed && it.pid) {
+      claimed = await Piece.findOneAndUpdate(
+        { pid: it.pid, status: 'In stock', oid: null },
+        { $set: { status: 'Reserved', oid: order._id, at } },
+        { new: true, sort: { received: 1 } },
+      );
+      if (claimed) it.vid = claimed.vid;
+    }
+    if (!claimed) { shortages.push({ pid: it.pid, vid: it.vid, qty: it.qty || 1 }); continue; }
     await Movement.create({
       _id: await nextMoveId(),
       code: claimed._id, pid: claimed.pid, vid: claimed.vid,

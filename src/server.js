@@ -27,6 +27,8 @@ import { homeBannersRouter } from './routes/homeBanners.js';
 import { piecesRouter, movementsRouter } from './routes/pieces.js';
 import { authRouter } from './routes/auth.js';
 import { customerAuthRouter } from './routes/customerAuth.js';
+import { customerPaymentRouter } from './routes/customerPayment.js';
+import { webhooksRouter } from './routes/webhooks.js';
 import { publicRouter } from './routes/public.js';
 import { requireAuth } from './middleware/auth.js';
 import { seedPiecesFromStock } from './seedPieces.js';
@@ -45,6 +47,11 @@ app.use(cors({
   // SEC-03: expose the refreshed-token header so the admin can pick it up.
   exposedHeaders: ['X-Refreshed-Token'],
 }));
+// Webhooks mount BEFORE express.json() because Razorpay's HMAC verification
+// needs the EXACT raw body bytes — parsing and re-stringifying JSON breaks
+// the signature. The webhook route uses its own express.raw() middleware.
+app.use('/api/webhooks', webhooksRouter);
+
 app.use(express.json({ limit: '2mb' }));
 
 // Ensure DB is connected before handling any request (safe for serverless cold starts).
@@ -73,6 +80,7 @@ app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '7d', immutable: true }
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.use('/api/auth', authRouter);
 app.use('/api/customer-auth', customerAuthRouter);
+app.use('/api/customer-auth', customerPaymentRouter);
 app.use('/api/public', publicRouter);
 
 // Protected endpoints — require a valid Bearer token
