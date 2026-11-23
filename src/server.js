@@ -22,8 +22,12 @@ import { statsRouter } from './routes/stats.js';
 import { uploadsRouter, UPLOAD_DIR } from './routes/uploads.js';
 import { occasionsRouter } from './routes/occasions.js';
 import { priceRangesRouter } from './routes/priceRanges.js';
+import { heroSlidesRouter } from './routes/heroSlides.js';
+import { homeBannersRouter } from './routes/homeBanners.js';
 import { piecesRouter, movementsRouter } from './routes/pieces.js';
 import { authRouter } from './routes/auth.js';
+import { customerAuthRouter } from './routes/customerAuth.js';
+import { publicRouter } from './routes/public.js';
 import { requireAuth } from './middleware/auth.js';
 import { seedPiecesFromStock } from './seedPieces.js';
 import { CmsPage } from './models/CmsPage.js';
@@ -54,6 +58,7 @@ app.use(async (req, res, next) => {
         try { await Order.syncIndexes(); } catch (e) { console.warn('[boot] Order.syncIndexes failed:', e.message); }
         try { await ensureDevSellerDetails(); } catch (e) { console.warn('[boot] dev seller upsert failed:', e.message); }
         try { await ensureInvoiceCounters(); } catch (e) { console.warn('[boot] invoice counter alignment failed:', e.message); }
+        try { await ensureHomeBanners(); } catch (e) { console.warn('[boot] home banners seed failed:', e.message); }
       })();
     }
     await globalThis.__bootReady;
@@ -67,6 +72,8 @@ app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '7d', immutable: true }
 // Public endpoints
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.use('/api/auth', authRouter);
+app.use('/api/customer-auth', customerAuthRouter);
+app.use('/api/public', publicRouter);
 
 // Protected endpoints — require a valid Bearer token
 app.use('/api/categories', requireAuth, categoriesRouter);
@@ -86,6 +93,8 @@ app.use('/api/stats', requireAuth, statsRouter);
 app.use('/api/uploads', requireAuth, uploadsRouter);
 app.use('/api/occasions', requireAuth, occasionsRouter);
 app.use('/api/price-ranges', requireAuth, priceRangesRouter);
+app.use('/api/hero-slides', requireAuth, heroSlidesRouter);
+app.use('/api/home-banners', requireAuth, homeBannersRouter);
 app.use('/api/pieces', requireAuth, piecesRouter);
 app.use('/api/movements', requireAuth, movementsRouter);
 
@@ -166,6 +175,30 @@ async function ensureHomePage() {
         desc: 'The storefront landing page. Upload a hero banner shown at the top above the homepage story.',
         updated: new Date().toISOString().slice(0, 10),
         body: '',
+      },
+    },
+    { upsert: true },
+  );
+}
+
+// Seed the Bridal Edit banner row if it doesn't exist yet. Defaults match
+// what the storefront's CraftStory.tsx currently hardcodes so the storefront
+// shows the same copy on a fresh DB. Also drops any leftover 'explore' row
+// from the brief window when Explore was also admin-controlled — the model
+// enum rejects writes to that slot now, but a stray row would still read
+// out via the public endpoint.
+async function ensureHomeBanners() {
+  const { HomeBanner } = await import('./models/HomeBanner.js');
+  await HomeBanner.deleteOne({ slot: 'explore' });
+  await HomeBanner.updateOne(
+    { slot: 'bridal' },
+    {
+      $setOnInsert: {
+        slot: 'bridal',
+        image: '/homebanner/banner3.webp',
+        eyebrow: 'The Bridal Edit',
+        title: 'Heirloom Bridal Silks',
+        description: 'Curated drapes for the bride and her moment.',
       },
     },
     { upsert: true },

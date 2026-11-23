@@ -30,8 +30,22 @@ export const positivePriceValidator = {
   message: 'Price must be greater than 0.',
 };
 export const compareAtValidator = function validate(v) {
-  // Mongoose runs validators as methods — `this` is the doc being saved.
-  return v == null || (typeof v === 'number' && v > this.price);
+  if (v == null) return true;
+  if (typeof v !== 'number') return false;
+  // Mongoose binds `this` to the document on .save() and to the Query on
+  // findOneAndUpdate/findByIdAndUpdate with runValidators. In the Query case
+  // `this.price` is undefined, so read price from the update payload instead
+  // (PUT overwrite puts fields at the top level; PATCH wraps them in $set).
+  let price = this.price;
+  if (typeof this.getUpdate === 'function') {
+    const u = this.getUpdate() || {};
+    const fromUpdate = u.$set?.price ?? u.price;
+    if (fromUpdate !== undefined) price = fromUpdate;
+  }
+  // Partial PATCH that doesn't touch price can't be validated here — allow it
+  // and rely on the next full save to catch a bad pairing.
+  if (typeof price !== 'number') return true;
+  return v > price;
 };
 
 // TAX-01: check whether seller details on Settings are real enough to print a tax invoice.

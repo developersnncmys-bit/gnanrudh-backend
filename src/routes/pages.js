@@ -37,6 +37,19 @@ pagesRouter.get('/:name', asyncHandler(async (req, res) => {
 
 pagesRouter.put('/:name', asyncHandler(async (req, res) => {
   const body = { ...req.body, name: req.params.name, updated: new Date().toISOString().slice(0, 10) };
+  // Keep banners[] and the legacy singular banner in sync so either caller shape works.
+  if (Array.isArray(body.banners)) {
+    body.banners = body.banners.filter((u) => typeof u === 'string' && u);
+    body.banner = body.banners[0] || '';
+  } else if (typeof body.banner === 'string') {
+    body.banners = body.banner ? [body.banner] : [];
+  }
   const p = await CmsPage.findOneAndUpdate({ name: req.params.name }, body, { new: true, upsert: true }).lean();
   res.json(p);
+}));
+
+pagesRouter.delete('/:name', asyncHandler(async (req, res) => {
+  const r = await CmsPage.deleteOne({ name: req.params.name });
+  if (!r.deletedCount) return res.status(404).json({ error: 'Page not found' });
+  res.json({ ok: true });
 }));

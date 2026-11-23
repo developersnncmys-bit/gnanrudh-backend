@@ -15,8 +15,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const UPLOAD_DIR = path.resolve(__dirname, '..', '..', 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const USE_CLOUDINARY = Boolean(process.env.CLOUDINARY_URL);
-if (USE_CLOUDINARY) cloudinary.config({ secure: true }); // CLOUDINARY_URL is picked up automatically
+// Cloudinary is enabled when either the discrete vars are set, or the single
+// CLOUDINARY_URL env is set (SDK default). Falls back to local disk otherwise.
+const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CLOUDINARY_URL } = process.env;
+const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || 'gnanrudh';
+const USE_CLOUDINARY = Boolean(
+  (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) || CLOUDINARY_URL,
+);
+if (USE_CLOUDINARY) {
+  if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) {
+    cloudinary.config({
+      cloud_name: CLOUDINARY_CLOUD_NAME,
+      api_key: CLOUDINARY_API_KEY,
+      api_secret: CLOUDINARY_API_SECRET,
+      secure: true,
+    });
+  } else {
+    cloudinary.config({ secure: true }); // picks up CLOUDINARY_URL from env
+  }
+}
 
 const diskStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
@@ -42,7 +59,7 @@ function uploadToCloudinary(file) {
   return new Promise((resolve, reject) => {
     const kind = file.mimetype.startsWith('video/') ? 'video' : 'image';
     const stream = cloudinary.uploader.upload_stream(
-      { folder: 'gnanrudh', resource_type: kind },
+      { folder: CLOUDINARY_FOLDER, resource_type: kind },
       (err, result) => (err ? reject(err) : resolve(result)),
     );
     stream.end(file.buffer);
