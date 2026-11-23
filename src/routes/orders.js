@@ -58,7 +58,11 @@ ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
     throw e;
   }
 
-  o.payment.status = 'Paid';
+  // COD orders settle at delivery, not here — keep the 'COD collected'
+  // semantic so the Payments filter and the GST invoice flag match
+  // reality. Everything else (prepaid, manual-UPI, manual-card, walk-in
+  // paid-in-store) marks as 'Paid'.
+  o.payment.status = o.payment?.method === 'Cash on delivery' ? 'COD collected' : 'Paid';
   o.status = 'Label generated';
   o.ship.courier = o.ship.courier || 'Delhivery';
   o.ship.awb = o.ship.awb || `${Math.floor(10000000 + Math.random() * 89999999)}11`;
@@ -90,6 +94,58 @@ ordersRouter.post('/:id/invoice', asyncHandler(async (req, res) => {
   const now = new Date();
   o.invoice = formatInvoice(now, await nextInvoiceNo(now));
   await o.save();
+  res.json(o.toObject());
+}));
+
+// Admin-driven payment status change. Lets staff correct the pill without
+// running the full confirm-payment side effects (piece reservation, label
+// generation, invoice issue). Useful when a courier reports a mismatched
+// COD outcome, a manual refund is reconciled offline, or a Razorpay
+// status needs to be fixed by hand. Validates against the same canonical
+// list the admin UI exposes so stray strings can't land in the DB.
+const PAYMENT_STATUSES = ['Paid', 'Pending', 'COD pending', 'COD collected', 'COD not collected', 'Refunded'];
+// Forward-only transitions. Mirrors the admin UI's TRANSITIONS map in
+// actions.js. Enforced server-side so a crafted request can't bypass
+// the UI and revert a settled payment back to Pending — a Paid order
+// can only move to Refunded (via a refund), nothing else.
+const PAYMENT_TRANSITIONS = {
+  'Pending': ['Paid', 'COD pending', 'COD collected'],
+  'COD pending': ['COD collected', 'COD not collected'],
+  'Paid': ['Refunded'],
+  'COD collected': ['Refunded'],
+  'COD not collected': [],
+  'Refunded': [],
+};
+ordersRouter.post('/:id/payment-status', asyncHandler(async (req, res) => {
+  const o = await Order.findById(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  const next = String(req.body?.status || '').trim();
+  if (!PAYMENT_STATUSES.includes(next)) {
+    return res.status(400).json({ error: `Payment status must be one of: ${PAYMENT_STATUSES.join(', ')}` });
+  }
+  const current = o.payment?.status || 'Pending';
+  // Allow the no-op case (e.g. the admin is just attaching a reference
+  // without changing the status) — same-to-same isn't a transition.
+  if (next !== current) {
+    const allowed = PAYMENT_TRANSITIONS[current] || [];
+    if (!allowed.includes(next)) {
+      return res.status(409).json({
+        error: allowed.length
+          ? `${current} can only move to: ${allowed.join(', ')}. ${next} is not a valid transition.`
+          : `${current} is a final payment state — it can't be changed.`,
+      });
+    }
+  }
+  if (!o.payment) o.payment = {};
+  o.payment.status = next;
+  if (typeof req.body?.ref === 'string' && req.body.ref.trim() && !o.payment.rzp) {
+    o.payment.rzp = req.body.ref.trim();
+  }
+  await o.save();
+  // Flipping to/from a paid state changes the customer's LTV + segment,
+  // so recompute. Safe to run even when the status didn't materially
+  // change — recomputeCustomer is idempotent.
+  await recomputeCustomer(o.cid);
   res.json(o.toObject());
 }));
 
@@ -165,6 +221,23 @@ ordersRouter.get('/stats/counts', asyncHandler(async (req, res) => {
     Order.countDocuments({ status: 'Delivery failed' }),
   ]);
   res.json({ pending, ndr });
+}));
+
+// INV-01: admin-created orders (phone-in, walk-in, manual entry) must
+// reserve pieces too, or the Inventory page's Reserved count and the
+// oversell guard both go stale. Mirrors the storefront flow in
+// customerPayment.js: create the order, try to reserve, roll back the
+// order on shortage. Mounted BEFORE `base` so it wins the POST / match.
+ordersRouter.post('/', asyncHandler(async (req, res) => {
+  const order = await Order.create(req.body);
+  try {
+    await reservePiecesForOrder(order, { by: byFromReq(req) });
+  } catch (e) {
+    await Order.deleteOne({ _id: order._id });
+    if (e.status === 409) return res.status(409).json({ error: 'Not enough stock to fulfil the order', details: e.details });
+    throw e;
+  }
+  res.status(201).json(order.toObject());
 }));
 
 ordersRouter.use('/', base);
