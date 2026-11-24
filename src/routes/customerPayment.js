@@ -7,6 +7,7 @@ import { Singleton } from '../models/Singleton.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { requireAuth } from '../middleware/auth.js';
 import { reservePiecesForOrder, releasePiecesForOrder } from './pieces.js';
+import { newForwardAwb } from '../awb.js';
 import { nextInvoiceNo, formatInvoice } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
 import { recomputeCustomer } from '../crm.js';
@@ -106,7 +107,15 @@ customerPaymentRouter.post('/orders', requireAuth, requireCustomer, asyncHandler
   }
   const shipping = Math.max(0, Number(body.shipping) || 0);
   const discount = Math.max(0, Number(body.discount) || 0);
-  const total = Math.max(0, sub - discount + shipping);
+  // GST — kept server-side so the Razorpay amount can't be short-charged
+  // by a tampered client. Must match the GST_RATE constant in
+  // CheckoutPopup.tsx (0.05 = 5%); changing this requires updating both.
+  // Tax is applied to (sub - discount + shipping), i.e. the amount the
+  // customer actually pays, matching the storefront's displayed total.
+  const GST_RATE = 0.05;
+  const taxable = Math.max(0, sub - discount + shipping);
+  const tax = Math.round(taxable * GST_RATE);
+  const total = taxable + tax;
 
   const order = await Order.create({
     _id: newOrderId(),
@@ -117,6 +126,7 @@ customerPaymentRouter.post('/orders', requireAuth, requireCustomer, asyncHandler
     coupon: body.coupon || null,
     discount,
     shipping,
+    tax,
     total,
     payment: {
       method: paymentMethod === 'cod' ? 'Cash on delivery' : 'Prepaid',
@@ -258,7 +268,7 @@ customerPaymentRouter.post('/payment/verify', requireAuth, requireCustomer, asyn
   o.payment.rzp = razorpay_payment_id;
   o.status = 'Label generated';
   o.ship.courier = o.ship.courier || 'Delhivery';
-  o.ship.awb = o.ship.awb || `${Math.floor(10000000 + Math.random() * 89999999)}11`;
+  o.ship.awb = o.ship.awb || newForwardAwb();
 
   // Invoice number is assigned only when seller details on Settings are
   // complete — mirrors the admin's confirm-payment behaviour. If the admin

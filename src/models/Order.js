@@ -34,6 +34,9 @@ const OrderSchema = new mongoose.Schema({
   coupon: { type: String, default: null },
   discount: { type: Number, default: 0 },
   shipping: { type: Number, default: 0 },
+  // TAX-02: GST recorded on the order so the admin invoice breakdown
+  // stays audit-ready. Legacy orders may be undefined; treat missing as 0.
+  tax: { type: Number, default: 0 },
   total: { type: Number, required: true },
   payment: PaymentSchema,
   status: { type: String, required: true, index: true },

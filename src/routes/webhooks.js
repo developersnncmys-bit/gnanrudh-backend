@@ -7,6 +7,7 @@ import { asyncHandler } from '../middleware/asyncHandler.js';
 import { nextInvoiceNo, formatInvoice } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
 import { recomputeCustomer } from '../crm.js';
+import { newForwardAwb } from '../awb.js';
 
 // Public, no-auth webhook endpoints called by third-party gateways. The
 // request body is the gateway's HMAC-signed JSON; we verify the signature
@@ -85,7 +86,7 @@ webhooksRouter.post(
       order.payment.rzp = rzpPaymentId;
       order.status = 'Label generated';
       order.ship.courier = order.ship.courier || 'Delhivery';
-      order.ship.awb = order.ship.awb || `${Math.floor(10000000 + Math.random() * 89999999)}11`;
+      order.ship.awb = order.ship.awb || newForwardAwb();
       if (!order.invoice) {
         const sett = await Singleton.findById('settings').lean();
         const ready = settingsReady(sett?.data);

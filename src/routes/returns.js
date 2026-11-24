@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { Return } from '../models/Return.js';
 import { Order } from '../models/Order.js';
-import { Product } from '../models/Product.js';
 import { ShipEvent } from '../models/ShipEvent.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
@@ -11,6 +10,7 @@ import { nextCnNo, formatCreditNote } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
 import { Singleton } from '../models/Singleton.js';
 import { recomputeCustomer } from '../crm.js';
+import { newReverseAwb } from '../awb.js';
 
 const base = crudRouter(Return, {
   searchFields: ['_id', 'oid', 'reason'],
@@ -72,7 +72,7 @@ returnsRouter.post('/:id/approve', asyncHandler(async (req, res) => {
   const r = await Return.findById(req.params.id);
   if (!r) return res.status(404).json({ error: 'Return not found' });
   r.status = 'Pickup scheduled';
-  r.awb = `R${Math.floor(10000000 + Math.random() * 89999999)}`;
+  r.awb = newReverseAwb();
   await r.save();
   await ShipEvent.create({
     _id: `SL${Date.now()}${Math.floor(Math.random() * 1000)}`,
@@ -91,9 +91,14 @@ returnsRouter.post('/:id/picked', asyncHandler(async (req, res) => {
 returnsRouter.post('/:id/received', asyncHandler(async (req, res) => {
   const r = await Return.findByIdAndUpdate(req.params.id, { $set: { status: 'Received' } }, { new: true }).lean();
   if (!r) return res.status(404).json({ error: 'Return not found' });
-  // Mark the shipped piece for this order+product as Returned.
+  // Transition the piece that was fulfilled for this order+product back to
+  // Returned. Accepts both 'Sold' (modern terminal state from
+  // shipPiecesForOrder — see INV-01 comment in Piece.js) and 'Shipped'
+  // (legacy terminal state on orders placed before the pieces refactor).
+  // Previously only matched 'Shipped', so refunds against modern orders
+  // left the piece stuck at 'Sold' forever and never restocked.
   try {
-    const piece = await Piece.findOne({ oid: r.oid, pid: r.pid, status: 'Shipped' });
+    const piece = await Piece.findOne({ oid: r.oid, pid: r.pid, status: { $in: ['Sold', 'Shipped', 'Packed'] } });
     if (piece) {
       const at = new Date().toISOString();
       const from = piece.status;
@@ -139,20 +144,26 @@ returnsRouter.post('/:id/refund', asyncHandler(async (req, res) => {
     await recomputeCustomer(o.cid); // DATA-04
   }
 
-  const p = await Product.findById(r.pid);
-  if (p) {
-    const it = (await Order.findById(r.oid).lean())?.items?.find((x) => x.pid === r.pid);
-    const v = p.variants.find((x) => x.id === it?.vid) || p.variants[0];
-    if (v) v.stock += 1;
-    await p.save();
-  }
+  // INV-01: `variant.stock` is a stale denormalisation. The whole app
+  // (admin + storefront) reads stock from pieces via piecesOf(), not from
+  // this field. Previously we incremented it here on refund — a dead
+  // write that just made the stale field drift further from reality.
+  // Removed. The real restock happens in the piece-transition block
+  // immediately below.
 
-  // Restock the returned piece: Returned (or still Shipped) → In stock.
+  // Restock the returned piece → In stock. Accepts 'Returned' (normal
+  // flow after /received landed) and also the terminal shipment states
+  // 'Sold' / 'Shipped' / 'Packed' in case the admin jumps straight to
+  // Refund without clicking Received. Previously only matched 'Returned'
+  // + 'Shipped', so a refund against a 'Sold' piece did nothing and the
+  // unit was permanently lost from inventory.
   try {
-    const piece = await Piece.findOne({ oid: r.oid, pid: r.pid, status: { $in: ['Returned', 'Shipped'] } });
+    const piece = await Piece.findOne({ oid: r.oid, pid: r.pid, status: { $in: ['Returned', 'Sold', 'Shipped', 'Packed'] } });
     if (piece) {
       const at = new Date().toISOString();
-      if (piece.status === 'Shipped') {
+      // If we skipped the Received step, bridge with a Movement so the
+      // audit log reads <from> → Returned → In stock cleanly.
+      if (['Sold', 'Shipped', 'Packed'].includes(piece.status)) {
         const from = piece.status;
         piece.status = 'Returned'; piece.at = at;
         await piece.save();

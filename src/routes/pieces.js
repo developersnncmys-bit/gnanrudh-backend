@@ -189,18 +189,20 @@ async function reservePiecesForOrder(order, { by = 'System' } = {}) {
       if (existing && existing.oid === order._id && ['Reserved', 'Packed'].includes(existing.status)) continue;
     }
     const at = new Date().toISOString();
-    // Reservation strategy:
-    //   1) If the line carries a vid, claim a piece with that exact vid.
-    //      This is the strict path — honours a shopper's explicit colour
-    //      pick and lets the admin's manual orders target a specific SKU.
-    //   2) If (1) finds nothing (or no vid was sent), fall back to any
-    //      in-stock piece for the same product. The storefront doesn't
-    //      currently force a colour pick before Add-to-Cart, so this
-    //      keeps checkout from bouncing with 409 when there's at least
-    //      one piece of the product available in any colour. When the
-    //      fallback claims a piece we rewrite `it.vid` so downstream
-    //      movement audit + packing lists show the colour that was
-    //      actually reserved.
+    // Reservation strategy (INV-03):
+    //   1) The line carries a vid (explicit colour pick) → claim a piece
+    //      with that EXACT vid. No silent cross-colour substitution — a
+    //      shopper who ordered Red must receive Red. If there's no piece
+    //      of that vid available, the line lands in `shortages` and the
+    //      order fails with a readable 409.
+    //   2) The line carries no vid (admin's manual order that didn't
+    //      pick a specific SKU) → fall back to any in-stock piece of the
+    //      same product and record which variant actually got reserved.
+    //
+    // Previously the no-vid fallback also ran when the requested vid was
+    // out of stock, silently shipping the wrong colour. The storefront's
+    // addToCart always passes the chosen variant, so the strict-vid path
+    // matches customer intent.
     let claimed = null;
     if (it.vid) {
       claimed = await Piece.findOneAndUpdate(
@@ -208,8 +210,7 @@ async function reservePiecesForOrder(order, { by = 'System' } = {}) {
         { $set: { status: 'Reserved', oid: order._id, at } },
         { new: true, sort: { received: 1 } },
       );
-    }
-    if (!claimed && it.pid) {
+    } else if (it.pid) {
       claimed = await Piece.findOneAndUpdate(
         { pid: it.pid, status: 'In stock', oid: null },
         { $set: { status: 'Reserved', oid: order._id, at } },

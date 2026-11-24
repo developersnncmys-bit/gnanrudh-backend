@@ -6,6 +6,7 @@ import { Singleton } from '../models/Singleton.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { reservePiecesForOrder, releasePiecesForOrder, shipPiecesForOrder } from './pieces.js';
+import { newForwardAwb } from '../awb.js';
 import { nextInvoiceNo, nextCnNo, formatInvoice, formatCreditNote } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
 import { recomputeCustomer } from '../crm.js';
@@ -65,7 +66,7 @@ ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
   o.payment.status = o.payment?.method === 'Cash on delivery' ? 'COD collected' : 'Paid';
   o.status = 'Label generated';
   o.ship.courier = o.ship.courier || 'Delhivery';
-  o.ship.awb = o.ship.awb || `${Math.floor(10000000 + Math.random() * 89999999)}11`;
+  o.ship.awb = o.ship.awb || newForwardAwb();
   let invoiceBlockedReason = null;
   if (!o.invoice) {
     const ready = await sellerReady();
@@ -159,6 +160,30 @@ ordersRouter.post('/:id/ship', asyncHandler(async (req, res) => {
   await o.save();
   await logShip(o, 'Packed and handed to the courier');
   await shipPiecesForOrder(o, { codes: req.body?.codes, by: byFromReq(req) });
+  res.json(o.toObject());
+}));
+
+// RET-04: manual "Mark delivered" action for the admin. Normally
+// `deliveredAt` is set when the Shiprocket Delivered webhook lands, but
+// if the integration is partial / the webhook was dropped / the order
+// shipped out-of-system, the admin needs a way to stamp the moment
+// manually. Without this the return window never opens
+// (checkReturnEligibility requires `deliveredAt`) and refund requests
+// are rejected forever. Accepts an optional ISO `at` so the admin can
+// backdate; defaults to now. Transitions status if the order isn't
+// already Delivered.
+ordersRouter.post('/:id/delivered', asyncHandler(async (req, res) => {
+  const o = await Order.findById(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  if (o.status === 'Delivered' && o.deliveredAt) {
+    return res.json(o.toObject()); // idempotent — safe to double-click
+  }
+  const raw = typeof req.body?.at === 'string' ? req.body.at.trim() : '';
+  const at = raw && !Number.isNaN(Date.parse(raw)) ? new Date(raw).toISOString() : new Date().toISOString();
+  o.status = 'Delivered';
+  o.deliveredAt = at;
+  await o.save();
+  await logShip(o, 'Delivered (marked by admin)', { by: byFromReq(req) });
   res.json(o.toObject());
 }));
 
