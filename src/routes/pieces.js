@@ -344,4 +344,4 @@ piecesRouter.post('/order/:oid/ship', asyncHandler(async (req, res) => {
   res.json({ ok: true, shipped });
 }));
 
-export { reservePiecesForOrder, releasePiecesForOrder, shipPiecesForOrder };
+export { reservePiecesForOrder, releasePiecesForOrder, shipPiecesForOrder, recordMove, syncProductStockFromPieces };

@@ -12,7 +12,12 @@ const OrderItemSchema = new mongoose.Schema({
 const PaymentSchema = new mongoose.Schema({
   method: String,
   status: String,
+  // Razorpay payment id, set after /payment/verify confirms a capture.
   rzp: { type: String, default: null },
+  // Razorpay order id (gateway-side), set when /payment/order creates it.
+  // Required for the admin "Check with Razorpay" flow to look up payment
+  // attempts after the fact — without it we have no way to query the gateway.
+  rzpOrderId: { type: String, default: null },
 }, { _id: false });
 
 const ShipSchema = new mongoose.Schema({

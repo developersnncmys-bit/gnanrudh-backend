@@ -10,6 +10,7 @@ import { newForwardAwb } from '../awb.js';
 import { nextInvoiceNo, nextCnNo, formatInvoice, formatCreditNote } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
 import { recomputeCustomer } from '../crm.js';
+import { getRazorpay } from '../razorpay.js';
 
 // AUD-01: the authenticated user is the audit trail; never trust req.body.by.
 const byFromReq = (req) => req.user?.email || 'System';
@@ -43,26 +44,18 @@ async function logShip(order, type, extra = {}) {
   return ev;
 }
 
-// Confirm payment, generate invoice + shipping label
-ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
-  const o = await Order.findById(req.params.id);
-  if (!o) return res.status(404).json({ error: 'Order not found' });
-  if (o.status !== 'Payment pending') return res.status(400).json({ error: 'Order is not pending payment' });
-
+// Shared confirm-side-effects: reserve pieces, mark paid, generate label,
+// issue invoice, log the ship event, recompute customer. Used by the admin
+// confirm-payment button AND the real Razorpay check endpoint below.
+// Returns { body, invoiceBlockedReason, status? } or throws.
+async function applyConfirmPayment(o, by) {
   // INV-01: reserve pieces BEFORE marking the order as paid. If any variant is
   // sold out, fail the request with 409 — never oversell. reservePiecesForOrder
   // rolls back any pieces it did claim before throwing.
-  try {
-    await reservePiecesForOrder(o, { by: byFromReq(req) });
-  } catch (e) {
-    if (e.status === 409) return res.status(409).json({ error: 'Not enough stock to fulfil the order', details: e.details });
-    throw e;
-  }
+  await reservePiecesForOrder(o, { by });
 
   // COD orders settle at delivery, not here — keep the 'COD collected'
-  // semantic so the Payments filter and the GST invoice flag match
-  // reality. Everything else (prepaid, manual-UPI, manual-card, walk-in
-  // paid-in-store) marks as 'Paid'.
+  // semantic so the Payments filter and the GST invoice flag match reality.
   o.payment.status = o.payment?.method === 'Cash on delivery' ? 'COD collected' : 'Paid';
   o.status = 'Label generated';
   o.ship.courier = o.ship.courier || 'Delhivery';
@@ -79,11 +72,136 @@ ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
   }
   await o.save();
   await logShip(o, 'Order pushed');
-  await recomputeCustomer(o.cid); // DATA-04: payment just flipped to Paid, LTV/segment need refresh.
+  await recomputeCustomer(o.cid); // DATA-04
+  return { invoiceBlockedReason };
+}
+
+// Confirm payment, generate invoice + shipping label
+ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
+  const o = await Order.findById(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  if (o.status !== 'Payment pending') return res.status(400).json({ error: 'Order is not pending payment' });
+
+  let invoiceBlockedReason = null;
+  try {
+    ({ invoiceBlockedReason } = await applyConfirmPayment(o, byFromReq(req)));
+  } catch (e) {
+    if (e.status === 409) return res.status(409).json({ error: 'Not enough stock to fulfil the order', details: e.details });
+    throw e;
+  }
   const body = o.toObject();
   if (invoiceBlockedReason) body.invoiceBlocked = invoiceBlockedReason;
   res.json(body);
 }));
+
+// Real "Check with Razorpay" — query the gateway for payment attempts
+// against this order and only confirm if a captured payment exists. If the
+// gateway shows an `authorized` payment (held but not captured), auto-capture
+// it first, then confirm. Anything else leaves the order in Payment pending
+// and reports back what the gateway said so the admin knows why.
+//
+// Response shapes:
+//   200 { outcome: 'confirmed', order, razorpay: {...} }  — payment captured & order now Paid
+//   200 { outcome: 'pending',   razorpay: {...} }         — no successful payment yet
+//   200 { outcome: 'failed',    razorpay: {...} }         — attempts only failed
+//   4xx / 503 for configuration / lookup errors.
+ordersRouter.post('/:id/razorpay-check', asyncHandler(async (req, res) => {
+  const o = await Order.findById(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  if (o.payment?.method === 'Cash on delivery') {
+    return res.status(400).json({ error: 'COD orders are not settled through Razorpay' });
+  }
+  if (o.status !== 'Payment pending') {
+    // Idempotent for already-confirmed orders — return the current state.
+    return res.json({ outcome: 'already-confirmed', order: o.toObject() });
+  }
+  const rzpOrderId = o.payment?.rzpOrderId;
+  if (!rzpOrderId) {
+    return res.status(409).json({
+      error:
+        'This order has no Razorpay order id yet. The customer never reached the Razorpay modal, so there is nothing to look up. Use Mark payment received if payment was collected out-of-band.',
+    });
+  }
+
+  const rzp = await getRazorpay();
+  if (!rzp) {
+    return res.status(503).json({ error: 'Payment gateway not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.' });
+  }
+
+  // fetchPayments returns { entity: 'collection', count, items: [...] }
+  // Each item has { id, status: 'created'|'authorized'|'captured'|'refunded'|'failed', amount, method, ... }
+  let rzpPayments;
+  try {
+    rzpPayments = await rzp.orders.fetchPayments(rzpOrderId);
+  } catch (err) {
+    return res.status(502).json({
+      error: `Razorpay lookup failed: ${err?.error?.description || err?.message || 'unknown error'}`,
+    });
+  }
+  const items = Array.isArray(rzpPayments?.items) ? rzpPayments.items : [];
+
+  // Prefer a captured payment. If none, try to capture an authorized one.
+  // Otherwise fall through to pending/failed reporting.
+  let captured = items.find((p) => p.status === 'captured');
+  if (!captured) {
+    const authorized = items.find((p) => p.status === 'authorized');
+    if (authorized) {
+      try {
+        // Capture amount must be in paise and match the authorized amount.
+        captured = await rzp.payments.capture(authorized.id, authorized.amount, authorized.currency || 'INR');
+      } catch (err) {
+        return res.status(502).json({
+          error: `Razorpay capture failed: ${err?.error?.description || err?.message || 'unknown error'}`,
+          attempts: items.map(summarisePayment),
+        });
+      }
+    }
+  }
+
+  if (captured) {
+    o.payment.rzp = captured.id;
+    let invoiceBlockedReason = null;
+    try {
+      ({ invoiceBlockedReason } = await applyConfirmPayment(o, byFromReq(req)));
+    } catch (e) {
+      if (e.status === 409) {
+        return res.status(409).json({
+          error: 'Razorpay confirmed the payment but stock is no longer available. Refund the customer manually.',
+          details: e.details,
+          razorpay: { paymentId: captured.id, attempts: items.map(summarisePayment) },
+        });
+      }
+      throw e;
+    }
+    const body = o.toObject();
+    if (invoiceBlockedReason) body.invoiceBlocked = invoiceBlockedReason;
+    return res.json({
+      outcome: 'confirmed',
+      order: body,
+      razorpay: { paymentId: captured.id, attempts: items.map(summarisePayment) },
+    });
+  }
+
+  const anyFailed = items.some((p) => p.status === 'failed');
+  const anyPending = items.some((p) => ['created', 'authorized'].includes(p.status));
+  return res.json({
+    outcome: anyPending ? 'pending' : anyFailed ? 'failed' : 'pending',
+    razorpay: { attempts: items.map(summarisePayment) },
+  });
+}));
+
+function summarisePayment(p) {
+  return {
+    id: p.id,
+    status: p.status,
+    method: p.method,
+    amount: p.amount,
+    currency: p.currency,
+    createdAt: p.created_at,
+    errorCode: p.error_code || null,
+    errorDescription: p.error_description || null,
+  };
+}
 
 // TAX-01: retry assigning an invoice number after seller details have been filled in.
 ordersRouter.post('/:id/invoice', asyncHandler(async (req, res) => {

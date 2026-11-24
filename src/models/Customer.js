@@ -56,13 +56,17 @@ const CustomerSchema = new mongoose.Schema({
     default: [],
     set: (v) => Array.isArray(v) ? [...new Set(v.filter(Boolean))] : [],
   },
-  // Account-tied cart. Each line is a {productId, quantity} pair. Mirrors
-  // the shop-store cart on the frontend. Cleared from the device on sign
-  // out and restored from this field on sign-in so the user's cart roams
-  // across devices and survives browser resets.
+  // Account-tied cart. Each line is a {productId, variantId?, quantity}
+  // triple. Mirrors the shop-store cart on the frontend. Cleared from the
+  // device on sign out and restored from this field on sign-in so the
+  // user's cart roams across devices and survives browser resets.
+  // variantId is optional for legacy / no-colour-picked entries and nullable
+  // in the DB; a (productId, null) and (productId, "<vid>") line coexist
+  // because they're different offers to the user (colour-less vs picked).
   cart: {
     type: [{
       productId: { type: String, required: true },
+      variantId: { type: String, default: null },
       quantity: { type: Number, default: 1, min: 1 },
       _id: false,
     }],

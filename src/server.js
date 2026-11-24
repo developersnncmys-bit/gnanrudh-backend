@@ -24,7 +24,9 @@ import { occasionsRouter } from './routes/occasions.js';
 import { priceRangesRouter } from './routes/priceRanges.js';
 import { heroSlidesRouter } from './routes/heroSlides.js';
 import { homeBannersRouter } from './routes/homeBanners.js';
-import { piecesRouter, movementsRouter } from './routes/pieces.js';
+import { piecesRouter, movementsRouter, recordMove } from './routes/pieces.js';
+import { Piece } from './models/Piece.js';
+import { Product } from './models/Product.js';
 import { authRouter } from './routes/auth.js';
 import { customerAuthRouter } from './routes/customerAuth.js';
 import { customerPaymentRouter } from './routes/customerPayment.js';
@@ -66,6 +68,7 @@ app.use(async (req, res, next) => {
         try { await ensureDevSellerDetails(); } catch (e) { console.warn('[boot] dev seller upsert failed:', e.message); }
         try { await ensureInvoiceCounters(); } catch (e) { console.warn('[boot] invoice counter alignment failed:', e.message); }
         try { await ensureHomeBanners(); } catch (e) { console.warn('[boot] home banners seed failed:', e.message); }
+        try { await writeOffOrphanPieces(); } catch (e) { console.warn('[boot] orphan piece write-off failed:', e.message); }
       })();
     }
     await globalThis.__bootReady;
@@ -110,6 +113,37 @@ app.use(notFound);
 app.use(errorHandler);
 
 export default app;
+
+// INV-03: one-shot historical cleanup. Scans every Piece whose pid no
+// longer resolves to a live Product (left behind by pre-cascade deletes)
+// and writes them off. Only touches outstanding states — Sold / Returned
+// pieces stay in their terminal shape so revenue reports and refund
+// windows keep their history. Runs once per process; subsequent restarts
+// find nothing to do and exit in a single query.
+async function writeOffOrphanPieces() {
+  const pending = await Piece.find({ status: { $in: ['In stock', 'Reserved', 'Packed'] } }).lean();
+  if (!pending.length) return;
+  const uniquePids = [...new Set(pending.map((p) => p.pid).filter(Boolean))];
+  const liveProducts = await Product.find({ _id: { $in: uniquePids } }).select('_id').lean();
+  const livePidSet = new Set(liveProducts.map((p) => p._id));
+  const orphanIds = pending
+    .filter((p) => p.pid && !livePidSet.has(p.pid))
+    .map((p) => p._id);
+  if (!orphanIds.length) return;
+  console.log(`[boot] writing off ${orphanIds.length} orphan piece(s) from deleted products…`);
+  let done = 0;
+  for (const code of orphanIds) {
+    const piece = await Piece.findById(code);
+    if (!piece) continue;
+    try {
+      await recordMove(piece, 'Written off', 'Product no longer in catalogue', { by: 'System', oid: null });
+      done += 1;
+    } catch (err) {
+      console.warn(`[boot] piece ${code} write-off failed:`, err.message);
+    }
+  }
+  console.log(`[boot] wrote off ${done} orphan piece(s).`);
+}
 
 // DEV-SEED: an already-seeded DB still holds the old placeholder seller details
 // (`29ABCDE1234F1Z5`, `+91 98xxx xxxxx`, `Bengaluru, Karnataka 560001`), which

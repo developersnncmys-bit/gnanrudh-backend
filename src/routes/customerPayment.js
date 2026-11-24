@@ -1,5 +1,4 @@
 import { Router } from 'express';
-import crypto from 'crypto';
 import { Order } from '../models/Order.js';
 import { Product } from '../models/Product.js';
 import { Customer } from '../models/Customer.js';
@@ -12,6 +11,7 @@ import { nextInvoiceNo, formatInvoice } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
 import { recomputeCustomer } from '../crm.js';
 import { config } from '../config.js';
+import { getRazorpay, verifyRazorpaySignature } from '../razorpay.js';
 import { Return } from '../models/Return.js';
 import { checkReturnEligibility } from './returns.js';
 import { Coupon } from '../models/Coupon.js';
@@ -41,30 +41,9 @@ const requireCustomer = asyncHandler(async (req, res, next) => {
   next();
 });
 
-// Lazy Razorpay client — constructed once per process, but only when the
-// keys are configured AND the npm package is actually installed. Routes
-// that need it should await `getRazorpay()` and fail with 503 when it
-// returns null, so (a) dev environments without keys get a clear error
-// instead of a confusing stacktrace from inside the SDK, and (b) a fresh
-// checkout without `npm install razorpay` still boots the server — only
-// the /payment/order route surfaces the missing dep.
-let rzpClient = null;
-let rzpImportFailed = false;
-async function getRazorpay() {
-  if (rzpClient) return rzpClient;
-  const { keyId, keySecret } = config.razorpay;
-  if (!keyId || !keySecret) return null;
-  if (rzpImportFailed) return null;
-  try {
-    const { default: Razorpay } = await import('razorpay');
-    rzpClient = new Razorpay({ key_id: keyId, key_secret: keySecret });
-    return rzpClient;
-  } catch (err) {
-    console.warn('[razorpay] npm package not installed — payment routes will 503. Run `npm install razorpay` in backend/ to enable.', err?.message || '');
-    rzpImportFailed = true;
-    return null;
-  }
-}
+// Razorpay client + signature verification live in ../razorpay.js so the
+// admin-side "Check with Razorpay" endpoint can reuse the same singleton.
+// See that module for how it fails soft when the SDK isn't installed.
 
 // Short, sortable, URL-safe order id. Prefix `GR` matches the seed data
 // convention so admin lists don't need to distinguish customer-placed
@@ -243,6 +222,13 @@ customerPaymentRouter.post('/payment/order', requireAuth, requireCustomer, async
     notes: { ourOrderId: o._id, customerEmail: req.customer.email || '' },
   });
 
+  // Persist the gateway order id so the admin can later look up payment
+  // attempts against it via POST /orders/:id/razorpay-check even if the
+  // customer never completes the modal flow and `payment.rzp` stays null.
+  if (!o.payment) o.payment = {};
+  o.payment.rzpOrderId = rzpOrder.id;
+  await o.save();
+
   res.json({
     rzpOrderId: rzpOrder.id,
     amount: rzpOrder.amount,
@@ -274,11 +260,11 @@ customerPaymentRouter.post('/payment/verify', requireAuth, requireCustomer, asyn
   // Signature is HMAC-SHA256 of `<rzp_order_id>|<rzp_payment_id>` keyed by
   // our Razorpay secret. Reject on any mismatch — never trust the client's
   // claim that the payment succeeded.
-  const expected = crypto
-    .createHmac('sha256', config.razorpay.keySecret)
-    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-    .digest('hex');
-  if (expected !== razorpay_signature) {
+  if (!verifyRazorpaySignature({
+    orderId: razorpay_order_id,
+    paymentId: razorpay_payment_id,
+    signature: razorpay_signature,
+  })) {
     return res.status(400).json({ error: 'Payment signature verification failed' });
   }
 

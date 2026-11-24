@@ -149,22 +149,27 @@ customerAuthRouter.get('/cart', requireAuth, requireCustomer, asyncHandler(async
   res.json({ items: Array.isArray(req.customer.cart) ? req.customer.cart : [] });
 }));
 
-// PUT /api/customer-auth/cart  { items: [{productId, quantity}] } — full
-// replace. We sanitize each item so bad payloads can't corrupt the doc:
-// non-string productIds get dropped, non-finite quantities floor to 1,
-// and anything negative is clamped. Dedupes repeated productIds by
-// summing quantities (so a race where two tabs push slightly different
-// shapes still converges to a usable cart on next read).
+// PUT /api/customer-auth/cart  { items: [{productId, variantId?, quantity}] }
+// — full replace. We sanitize each item so bad payloads can't corrupt the
+// doc: non-string productIds get dropped, non-finite quantities floor to 1,
+// and anything negative is clamped. Dedupes repeated (productId, variantId)
+// pairs by summing quantities — a `(pid, null)` and a `(pid, "v1")` line
+// are DIFFERENT keys and both survive the dedupe, matching how the
+// frontend keys variant-aware cart rows.
 customerAuthRouter.put('/cart', requireAuth, requireCustomer, asyncHandler(async (req, res) => {
   const raw = Array.isArray(req.body?.items) ? req.body.items : [];
-  const byId = new Map();
+  const byKey = new Map();
   for (const it of raw) {
     if (!it || typeof it.productId !== 'string') continue;
+    const variantId = typeof it.variantId === 'string' && it.variantId ? it.variantId : null;
     const qty = Number(it.quantity);
     const safeQty = Number.isFinite(qty) ? Math.max(1, Math.floor(qty)) : 1;
-    byId.set(it.productId, (byId.get(it.productId) || 0) + safeQty);
+    const key = `${it.productId}::${variantId || ''}`;
+    const prev = byKey.get(key);
+    if (prev) prev.quantity += safeQty;
+    else byKey.set(key, { productId: it.productId, variantId, quantity: safeQty });
   }
-  req.customer.cart = Array.from(byId, ([productId, quantity]) => ({ productId, quantity }));
+  req.customer.cart = Array.from(byKey.values());
   await req.customer.save();
   res.json({ items: req.customer.cart });
 }));
