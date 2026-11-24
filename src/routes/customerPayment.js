@@ -14,6 +14,8 @@ import { recomputeCustomer } from '../crm.js';
 import { config } from '../config.js';
 import { Return } from '../models/Return.js';
 import { checkReturnEligibility } from './returns.js';
+import { Coupon } from '../models/Coupon.js';
+import { validateCoupon } from '../coupons.js';
 
 // Customer-side order + payment routes. Lives separately from customerAuth
 // so the Razorpay wiring and the order-persistence layer stay readable.
@@ -106,7 +108,29 @@ customerPaymentRouter.post('/orders', requireAuth, requireCustomer, asyncHandler
     sub += price * qty;
   }
   const shipping = Math.max(0, Number(body.shipping) || 0);
-  const discount = Math.max(0, Number(body.discount) || 0);
+
+  // CPN-03: when a coupon is attached, recompute the discount server-side
+  // against the live catalogue + the signed-in customer's history. The
+  // client is NOT trusted — a tampered payload that sends a coupon code
+  // with a fabricated discount is caught here and either corrected (if
+  // the coupon is still valid) or rejected (if it's expired / off / not
+  // eligible). If no coupon is attached the discount must be zero.
+  const couponCode = typeof body.coupon === 'string' ? body.coupon.trim() : '';
+  let discount = 0;
+  if (couponCode) {
+    const coupon = await Coupon.findById(couponCode);
+    if (!coupon) return res.status(400).json({ error: 'Coupon not found' });
+    const productsMap = Object.fromEntries(products.map((p) => [p._id, p]));
+    const result = validateCoupon({
+      coupon: coupon.toObject(),
+      customer: req.customer?.toObject ? req.customer.toObject() : req.customer,
+      items: lines,
+      products: productsMap,
+    });
+    if (!result.ok) return res.status(400).json({ error: result.reason || 'Coupon not applicable' });
+    discount = Math.max(0, Number(result.discount) || 0);
+  }
+
   // GST — kept server-side so the Razorpay amount can't be short-charged
   // by a tampered client. Must match the GST_RATE constant in
   // CheckoutPopup.tsx (0.05 = 5%); changing this requires updating both.

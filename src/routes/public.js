@@ -8,6 +8,9 @@ import { HomeBanner } from '../models/HomeBanner.js';
 import { Product } from '../models/Product.js';
 import { Piece } from '../models/Piece.js';
 import { Singleton } from '../models/Singleton.js';
+import { Coupon } from '../models/Coupon.js';
+import { Customer } from '../models/Customer.js';
+import { validateCoupon } from '../coupons.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 
 // Overwrites each variant's stored `stock` with the live count of pieces
@@ -129,6 +132,53 @@ publicRouter.get('/products/:id', asyncHandler(async (req, res) => {
 publicRouter.get('/occasions', asyncHandler(async (req, res) => {
   const items = await Occasion.find({}).sort({ order: 1, name: 1 }).lean();
   res.json({ items, total: items.length, limit: items.length, skip: 0 });
+}));
+
+// CPN-03: public list of currently-redeemable coupons for the checkout
+// strip. Filters out admin-disabled, expired, and limit-reached rows so a
+// scraper can't surface a coupon that's dead on the wire. Strips the
+// internal `uses` counter — the storefront never needs it and exposing it
+// leaks redemption volumes. The admin endpoint (`/api/coupons`) stays
+// auth-gated for management; this one is read-only + safe to cache.
+publicRouter.get('/coupons', asyncHandler(async (req, res) => {
+  const todayIso = new Date().toISOString();
+  const rows = await Coupon.find({
+    on: true,
+    $or: [{ ends: null }, { ends: { $gte: todayIso } }],
+  }).sort({ value: -1, _id: 1 }).lean();
+  const items = rows
+    .filter((c) => c.limit == null || (c.uses || 0) < c.limit)
+    .map((c) => ({
+      code: c._id,
+      kind: c.kind,
+      value: c.value,
+      min: c.min || 0,
+      scope: c.scope || null,
+      ends: c.ends || null,
+    }));
+  res.json({ items, total: items.length, limit: items.length, skip: 0 });
+}));
+
+// CPN-03: public coupon validation. Same business logic as the admin
+// `/api/coupons/:code/validate` route — we deliberately share
+// `validateCoupon` so a change to percent/flat math, min-order, or scope
+// matching lands in both places at once. Un-auth because the storefront
+// needs to show the live discount BEFORE the customer places the order.
+// Order creation re-validates from the server too (see customerPayment),
+// so a tampered response here can't actually under-charge.
+publicRouter.post('/coupons/:code/validate', asyncHandler(async (req, res) => {
+  const code = String(req.params.code || '').trim();
+  if (!code) return res.status(400).json({ ok: false, reason: 'Missing coupon code' });
+  const coupon = await Coupon.findById(code);
+  if (!coupon) return res.status(404).json({ ok: false, reason: 'Coupon not found' });
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!items.length) return res.status(400).json({ ok: false, reason: 'No items in cart' });
+  const customer = req.body?.cid ? await Customer.findById(req.body.cid).lean() : null;
+  const pidList = [...new Set(items.map((it) => it.pid).filter(Boolean))];
+  const prods = await Product.find({ _id: { $in: pidList } }).lean();
+  const products = Object.fromEntries(prods.map((p) => [p._id, p]));
+  const result = validateCoupon({ coupon: coupon.toObject(), customer, items, products });
+  res.json(result);
 }));
 
 // Single CMS page by exact name (e.g. "Privacy policy"). Substitutes policy
