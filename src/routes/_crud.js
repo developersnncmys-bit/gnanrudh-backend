@@ -20,7 +20,12 @@ import { asyncHandler } from '../middleware/asyncHandler.js';
 // `limit=0` used to mean "everything" and the bootstrap used it on every list; now
 // the server clamps and returns at most PAGE_MAX rows per request.
 const PAGE_DEFAULT = 50;
-const PAGE_MAX = 100;
+// Raised from 100 → 500 so the admin's page-through-everything bootstrap
+// finishes in a handful of parallel round-trips instead of dozens of
+// sequential ones. Still leaves plenty of headroom — .lean() reads of
+// 500 docs comfortably fit under Vercel's response size + timeout budget
+// for every collection in this schema.
+const PAGE_MAX = 500;
 
 export function parsePaging(query) {
   let limit = Number(query.limit);
