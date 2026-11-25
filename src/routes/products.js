@@ -81,7 +81,10 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
     const size = String(r.size || '').trim() || null;
     const skuRaw = String(r.sku || '').trim();
     const statusRaw = String(r.status || '').trim();
-    const status = ['Draft', 'Active', 'Hidden'].includes(statusRaw) ? statusRaw : 'Draft';
+    // Default to Active so bulk-uploaded sarees appear on the storefront
+    // immediately. Admins who want a staging buffer can still set the row
+    // to Draft explicitly in the CSV status column.
+    const status = ['Draft', 'Active', 'Hidden'].includes(statusRaw) ? statusRaw : 'Active';
     if (!name) { results.push({ line: i + 1, ok: false, error: 'name is empty' }); continue; }
     if (!categoryRaw) { results.push({ line: i + 1, name, ok: false, error: 'category is empty' }); continue; }
     if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) { results.push({ line: i + 1, name, ok: false, error: 'selling_price must be a positive number' }); continue; }

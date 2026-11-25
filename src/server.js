@@ -43,8 +43,23 @@ const app = express();
 // SEC-04: trust the Vercel proxy so req.ip and X-Forwarded-For hold the real client IP.
 app.set('trust proxy', 1);
 
+// CORS allow-list:
+//   1. Exact origins from CORS_ORIGIN env (prod domains + localhost).
+//   2. Any Vercel preview / production URL belonging to one of OUR projects
+//      — admin, storefront, and backend's own origin. This means a new PR
+//      preview (gnanrudh-admin-git-some-branch-xyz.vercel.app) works out of
+//      the box without anyone updating an env var.
+//   3. A missing Origin header (server-to-server, curl, same-origin) passes
+//      so health checks and the Shiprocket / Razorpay webhooks aren't blocked.
+// Every other origin is refused with a clear error in the server logs.
+const OUR_VERCEL_PROJECT = /^https:\/\/(gnanrudh-admin|gnanrudh-website|gnanrudh-backend)(-[a-z0-9-]+)?\.vercel\.app$/i;
 app.use(cors({
-  origin: config.corsOrigins,
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (config.corsOrigins.includes(origin)) return cb(null, true);
+    if (OUR_VERCEL_PROJECT.test(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} is not allowed`));
+  },
   credentials: true,
   // SEC-03: expose the refreshed-token header so the admin can pick it up.
   exposedHeaders: ['X-Refreshed-Token'],
