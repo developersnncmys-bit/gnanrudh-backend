@@ -88,19 +88,22 @@ piecesRouter.post('/:code/move', asyncHandler(async (req, res) => {
   res.json(piece.toObject());
 }));
 
-piecesRouter.post('/:code/printed', asyncHandler(async (req, res) => {
-  const p = await Piece.findByIdAndUpdate(req.params.code, { $set: { printed: true } }, { new: true }).lean();
-  if (!p) return res.status(404).json({ error: 'Piece not found' });
-  res.json(p);
-}));
-
 /* ---------- bulk: mark many printed ---------- */
+// MUST come before `/:code/printed` — Express resolves routes in
+// registration order, and `/:code/printed` would otherwise swallow
+// `/bulk/printed` with `code='bulk'` and return a 404.
 
 piecesRouter.post('/bulk/printed', asyncHandler(async (req, res) => {
   const codes = Array.isArray(req.body?.codes) ? req.body.codes : [];
   if (!codes.length) return res.json({ ok: true, updated: 0 });
   const r = await Piece.updateMany({ _id: { $in: codes } }, { $set: { printed: true } });
   res.json({ ok: true, updated: r.modifiedCount });
+}));
+
+piecesRouter.post('/:code/printed', asyncHandler(async (req, res) => {
+  const p = await Piece.findByIdAndUpdate(req.params.code, { $set: { printed: true } }, { new: true }).lean();
+  if (!p) return res.status(404).json({ error: 'Piece not found' });
+  res.json(p);
 }));
 
 /* ---------- create new pieces when stock is received ---------- */
