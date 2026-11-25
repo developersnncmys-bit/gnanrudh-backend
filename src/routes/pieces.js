@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { randomBytes } from 'crypto';
 import { Piece } from '../models/Piece.js';
 import { Movement } from '../models/Movement.js';
 import { Product } from '../models/Product.js';
@@ -45,9 +46,23 @@ movementsRouter.get('/', asyncHandler(async (req, res) => {
 
 /* ---------- helpers ---------- */
 
+// Movement _id generator. Uses a process-local counter + an 8-char random
+// suffix instead of estimatedDocumentCount() + a 3-char ms-stamp.
+//
+// The old form collided under two scenarios:
+//   1. Tight loops (e.g. 2,000-piece product delete) where estimatedDocumentCount
+//      lags behind in-flight inserts, so `n` repeats across sequential calls.
+//   2. Two inserts landing in the same millisecond — the last-3-chars-of-ms
+//      suffix only has 46 656 values and wraps every 46 seconds.
+//
+// Random 4-byte (8 hex chars = 4 billion values) suffix makes collisions
+// vanishingly unlikely even if the counter base is stale; the per-process
+// counter guarantees uniqueness inside a single hot loop without hitting
+// the DB at all, so this is also much faster than the old implementation.
+let moveCounter = 0;
 export async function nextMoveId() {
-  const n = await Movement.estimatedDocumentCount();
-  return `MV${n + 1}${Date.now().toString(36).slice(-3)}`;
+  moveCounter += 1;
+  return `MV${Date.now().toString(36)}${moveCounter.toString(36)}${randomBytes(4).toString('hex')}`;
 }
 
 async function recordMove(piece, to, note, { by = 'Store', at = new Date().toISOString(), oid } = {}) {
@@ -233,6 +248,74 @@ piecesRouter.post('/reconcile/:pid', asyncHandler(async (req, res) => {
   }
   await syncProductStockFromPieces(prod._id);
   res.json({ ok: true });
+}));
+
+/* ---------- cleanup: orphan pieces + stale movements ---------- */
+
+// Hard-deletes pieces that can no longer be traced back to a live product
+// or variant, plus every Movement row that referenced them. Used to tidy
+// up after a failed bulk import, a direct DB edit, or legacy schema drift.
+// Audit-preserving by default — won't touch pieces whose parent product +
+// variant both resolve, even if the piece sits in a terminal state like
+// 'Sold' or 'Written off'.
+//
+// Query params:
+//   dryRun=1   → report what would be removed without deleting. Default.
+//   dryRun=0   → actually delete. Required to make changes.
+//
+// Response:
+//   { orphanPids: string[], orphanVids: string[], pieceCount, movementCount, dryRun }
+piecesRouter.post('/admin/cleanup-orphans', asyncHandler(async (req, res) => {
+  const dryRun = req.query.dryRun !== '0'; // default true — safe
+  // Pull every pid/vid we currently know about. Doing one bulk scan beats
+  // 5,000 findById round-trips when the pieces collection is large.
+  const products = await Product.find({}).select('_id variants.id').lean();
+  const livePids = new Set(products.map((p) => p._id));
+  const liveVidsByPid = new Map(
+    products.map((p) => [p._id, new Set((p.variants || []).map((v) => v.id))]),
+  );
+
+  // Candidates in two buckets: product gone, or product exists but variant gone.
+  const pieces = await Piece.find({}).select('_id pid vid').lean();
+  const orphanPidPieces = [];
+  const orphanVidPieces = [];
+  const orphanPidSet = new Set();
+  const orphanVidSet = new Set();
+  for (const u of pieces) {
+    if (!livePids.has(u.pid)) {
+      orphanPidPieces.push(u._id);
+      orphanPidSet.add(u.pid);
+      continue;
+    }
+    const variants = liveVidsByPid.get(u.pid);
+    if (variants && !variants.has(u.vid)) {
+      orphanVidPieces.push(u._id);
+      orphanVidSet.add(u.vid);
+    }
+  }
+  const allOrphanCodes = [...orphanPidPieces, ...orphanVidPieces];
+
+  const summary = {
+    dryRun,
+    orphanPids: [...orphanPidSet],
+    orphanVids: [...orphanVidSet],
+    pieceCount: allOrphanCodes.length,
+    movementCount: 0,
+  };
+
+  if (allOrphanCodes.length === 0) return res.json(summary);
+
+  // Count movements before doing anything — same count whether dry-run or real.
+  summary.movementCount = await Movement.countDocuments({ code: { $in: allOrphanCodes } });
+
+  if (!dryRun) {
+    // Delete movements first so the audit trail doesn't get briefly broken
+    // in the other direction (dangling Movement whose piece vanished).
+    await Movement.deleteMany({ code: { $in: allOrphanCodes } });
+    await Piece.deleteMany({ _id: { $in: allOrphanCodes } });
+  }
+
+  res.json(summary);
 }));
 
 /* ---------- order lifecycle helpers ---------- */

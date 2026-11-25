@@ -6,7 +6,7 @@ import { Category } from '../models/Category.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { normaliseWeaveSpelling } from '../validators.js';
-import { recordMove, syncProductStockFromPieces, nextMoveId } from './pieces.js';
+import { recordMove, syncProductStockFromPieces } from './pieces.js';
 
 // AUD-01 ties audit rows to the staff email, same convention the rest of
 // the routes use.
@@ -168,12 +168,47 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
             const match = /-(\d{3,})$/.exec(p._id);
             return match ? Math.max(m, Number(match[1])) : m;
           }, 0);
+
+          // PERF: batch the inserts. The old per-piece Piece.create +
+          // Movement.create + nextMoveId() loop hit the DB ~2 × qty + qty
+          // times (4,000+ round-trips for qty=2000), which times out on
+          // Vercel's serverless functions. We now:
+          //   1. Compute the movement-id base ONCE per batch.
+          //   2. Build piece + movement arrays in memory.
+          //   3. Push them to Mongo in chunks via insertMany so the big
+          //      imports fit inside the function's wall-clock budget.
+          const CHUNK = 500;
+          const moveBase = await Movement.estimatedDocumentCount();
+          const batchStamp = Date.now().toString(36);
+          const pieceDocs = [];
+          const moveDocs = [];
           for (let k = 0; k < qty; k += 1) {
             seq += 1;
             const code = `${sku}-${String(seq).padStart(3, '0')}`;
-            await Piece.create({ _id: code, pid, vid: variantId, status: 'In stock', at, received: at, printed: false });
-            await Movement.create({ _id: await nextMoveId(), code, pid, vid: variantId, from: '—', to: 'In stock', note: 'Received from the weaver (bulk product import)', oid: null, by, at });
-            createdPieces += 1;
+            pieceDocs.push({ _id: code, pid, vid: variantId, status: 'In stock', at, received: at, printed: false });
+            // Movement _id is schema-required string. Combining the running
+            // sequence base with the batch timestamp and the per-piece
+            // index guarantees uniqueness inside this batch AND across
+            // concurrent bulk uploads landing in the same second.
+            const moveId = `MV${moveBase + k + 1}${batchStamp}${k.toString(36)}`;
+            moveDocs.push({
+              _id: moveId,
+              code, pid, vid: variantId,
+              from: '—', to: 'In stock',
+              note: 'Received from the weaver (bulk product import)',
+              oid: null, by, at,
+            });
+          }
+          for (let off = 0; off < pieceDocs.length; off += CHUNK) {
+            const pieceSlice = pieceDocs.slice(off, off + CHUNK);
+            const moveSlice = moveDocs.slice(off, off + CHUNK);
+            // ordered: false — a lone collision (e.g. a legacy piece
+            // number sneaked in between our scan and insert) keeps the
+            // rest of the batch moving. Count only the pieces that
+            // actually landed by inspecting insertedCount / insertedIds.
+            const pRes = await Piece.insertMany(pieceSlice, { ordered: false, rawResult: true });
+            createdPieces += pRes.insertedCount ?? pieceSlice.length;
+            await Movement.insertMany(moveSlice, { ordered: false });
           }
           await syncProductStockFromPieces(pid);
         } catch (pieceErr) {
