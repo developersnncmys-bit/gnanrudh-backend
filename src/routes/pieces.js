@@ -45,7 +45,7 @@ movementsRouter.get('/', asyncHandler(async (req, res) => {
 
 /* ---------- helpers ---------- */
 
-async function nextMoveId() {
+export async function nextMoveId() {
   const n = await Movement.estimatedDocumentCount();
   return `MV${n + 1}${Date.now().toString(36).slice(-3)}`;
 }
@@ -104,6 +104,69 @@ piecesRouter.post('/:code/printed', asyncHandler(async (req, res) => {
   const p = await Piece.findByIdAndUpdate(req.params.code, { $set: { printed: true } }, { new: true }).lean();
   if (!p) return res.status(404).json({ error: 'Piece not found' });
   res.json(p);
+}));
+
+/* ---------- bulk receive: CSV-driven stock receipts ---------- */
+// Rows are validated and executed in order; a failed row (bad SKU,
+// non-positive qty) is skipped and reported back so the admin can
+// fix those lines and re-upload only the stragglers. Partial success
+// is intentional — a 400 would force the admin to retry even the
+// rows that landed fine.
+piecesRouter.post('/receive/bulk', asyncHandler(async (req, res) => {
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  const by = req.user?.email || 'System';
+  // Pre-fetch every product + build a fast SKU → {prod, variant} index.
+  const prods = await Product.find({}).lean();
+  const bySku = new Map();
+  for (const p of prods) {
+    for (const v of (p.variants || [])) {
+      if (v.sku) bySku.set(String(v.sku).toUpperCase(), { pid: p._id, vid: v.id, sku: v.sku });
+    }
+  }
+  const results = [];
+  const seqCache = new Map(); // vid → current max suffix
+  for (let i = 0; i < rows.length; i += 1) {
+    const r = rows[i] || {};
+    const sku = String(r.sku || '').trim().toUpperCase();
+    const qty = Math.max(0, Number(r.qty) | 0);
+    const note = String(r.note || '').trim() || 'Received from the weaver (bulk)';
+    const receivedRaw = String(r.received_on || '').trim();
+    const receivedDate = receivedRaw ? new Date(receivedRaw) : new Date();
+    if (!sku) { results.push({ line: i + 1, ok: false, error: 'sku is empty' }); continue; }
+    if (!qty) { results.push({ line: i + 1, sku, ok: false, error: 'qty must be a positive integer' }); continue; }
+    if (Number.isNaN(receivedDate.getTime())) { results.push({ line: i + 1, sku, ok: false, error: 'received_on is not a valid date' }); continue; }
+    const hit = bySku.get(sku);
+    if (!hit) { results.push({ line: i + 1, sku, ok: false, error: 'unknown sku' }); continue; }
+    const { pid, vid } = hit;
+    // Compute the next piece-code suffix per variant. Cache across rows
+    // so two rows for the same SKU keep counting upward.
+    let seq = seqCache.get(vid);
+    if (seq === undefined) {
+      const existing = await Piece.find({ vid }).select('_id').lean();
+      seq = existing.reduce((m, p) => {
+        const match = /-(\d{3,})$/.exec(p._id);
+        return match ? Math.max(m, Number(match[1])) : m;
+      }, 0);
+    }
+    const at = new Date().toISOString();
+    const received = receivedDate.toISOString();
+    const createdCodes = [];
+    for (let k = 0; k < qty; k += 1) {
+      seq += 1;
+      const code = `${hit.sku}-${String(seq).padStart(3, '0')}`;
+      await Piece.create({ _id: code, pid, vid, status: 'In stock', at, received, printed: false });
+      await Movement.create({ _id: await nextMoveId(), code, pid, vid, from: '—', to: 'In stock', note, oid: null, by, at });
+      createdCodes.push(code);
+    }
+    seqCache.set(vid, seq);
+    await syncProductStockFromPieces(pid);
+    results.push({ line: i + 1, sku, ok: true, created: createdCodes.length, codes: createdCodes });
+  }
+  const totals = results.reduce((a, r) => {
+    if (r.ok) { a.ok += 1; a.pieces += r.created; } else { a.failed += 1; }
+    return a;
+  }, { ok: 0, failed: 0, pieces: 0 });
+  res.status(201).json({ results, totals });
 }));
 
 /* ---------- create new pieces when stock is received ---------- */

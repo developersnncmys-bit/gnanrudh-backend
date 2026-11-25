@@ -1,10 +1,12 @@
 import { Router } from 'express';
 import { Product } from '../models/Product.js';
 import { Piece } from '../models/Piece.js';
+import { Movement } from '../models/Movement.js';
+import { Category } from '../models/Category.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { normaliseWeaveSpelling } from '../validators.js';
-import { recordMove, syncProductStockFromPieces } from './pieces.js';
+import { recordMove, syncProductStockFromPieces, nextMoveId } from './pieces.js';
 
 // AUD-01 ties audit rows to the staff email, same convention the rest of
 // the routes use.
@@ -30,6 +32,164 @@ productsRouter.use((req, res, next) => {
   }
   next();
 });
+
+// Bulk create: POST /products/bulk  { rows: [{name, category, price, weave, occasions, colour, hex, size, sku}] }
+// Creates one Product + one initial Variant per row. Images are blank —
+// the admin uploads them later from each product's drawer. Status
+// defaults to 'Draft' so no partial products leak onto the storefront
+// before they have a photo. Unknown / missing category names are
+// reported back per-row rather than failing the whole batch.
+productsRouter.post('/bulk', asyncHandler(async (req, res) => {
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (!rows.length) return res.status(400).json({ error: 'rows[] required' });
+  // Pre-fetch categories once; match on both _id (slug) and name
+  // (case-insensitive) so admins can type whichever they remember.
+  const cats = await Category.find({}).lean();
+  const byCat = new Map();
+  for (const c of cats) {
+    byCat.set(String(c._id).toLowerCase(), c);
+    if (c.name) byCat.set(String(c.name).toLowerCase(), c);
+  }
+  // Seed the next product id from the current catalogue max (P<N>).
+  // Start at 1000 so a fresh DB opens at P1001, matching the admin's
+  // own numbering rule in actions.js.
+  const existing = await Product.find({}).select('_id').lean();
+  let nextNum = existing.reduce((m, p) => {
+    const n = parseInt(String(p._id || '').replace(/^P/, ''), 10);
+    return Number.isFinite(n) && n > m ? n : m;
+  }, 1000);
+  const results = [];
+  const by = req.user?.email || 'System';
+  for (let i = 0; i < rows.length; i += 1) {
+    const r = rows[i] || {};
+    const name = String(r.name || '').trim();
+    const categoryRaw = String(r.category || '').trim();
+    // Accept either `selling_price` (preferred, mirrors Indian e-com)
+    // or the legacy `price` alias so a template from an earlier release
+    // keeps working.
+    const sellingPrice = Number(r.selling_price ?? r.price);
+    // MRP maps to the product's `compareAt` strikethrough. Optional —
+    // when present it must be greater than the selling price (schema
+    // enforces this on save).
+    const mrpRaw = r.mrp ?? r.compareAt;
+    const mrp = mrpRaw === undefined || mrpRaw === '' ? null : Number(mrpRaw);
+    const qty = Math.max(0, Number(r.qty) | 0);
+    const colour = String(r.colour || '').trim();
+    const occasions = String(r.occasions || '').split('|').map((s) => s.trim()).filter(Boolean);
+    const weave = String(r.weave || '').trim();
+    const hex = String(r.hex || '').trim() || '#666666';
+    const size = String(r.size || '').trim() || null;
+    const skuRaw = String(r.sku || '').trim();
+    const statusRaw = String(r.status || '').trim();
+    const status = ['Draft', 'Active', 'Hidden'].includes(statusRaw) ? statusRaw : 'Draft';
+    if (!name) { results.push({ line: i + 1, ok: false, error: 'name is empty' }); continue; }
+    if (!categoryRaw) { results.push({ line: i + 1, name, ok: false, error: 'category is empty' }); continue; }
+    if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) { results.push({ line: i + 1, name, ok: false, error: 'selling_price must be a positive number' }); continue; }
+    if (mrp !== null && (!Number.isFinite(mrp) || mrp <= sellingPrice)) { results.push({ line: i + 1, name, ok: false, error: 'mrp must be greater than selling_price' }); continue; }
+    if (!colour) { results.push({ line: i + 1, name, ok: false, error: 'colour is empty' }); continue; }
+    if (!occasions.length) { results.push({ line: i + 1, name, ok: false, error: 'occasions required (pipe-separated, e.g. Festive|Everyday)' }); continue; }
+    const cat = byCat.get(categoryRaw.toLowerCase());
+    if (!cat) { results.push({ line: i + 1, name, ok: false, error: `unknown category: ${categoryRaw}` }); continue; }
+    try {
+      // Reserve a fresh P-id. If the computed pid collides with an
+      // existing row (prior bulk run, leftover from a partial failure,
+      // concurrent write), bump and retry up to a sane cap so we never
+      // silently skip a row over a numbering collision. `nextNum` is
+      // never rolled back — once we've probed a number, treat it as
+      // taken for the rest of this batch so subsequent rows don't land
+      // on the same collision.
+      let prod = null;
+      let pid = '';
+      let sku = '';
+      let variantId = '';
+      let createPidError = null;
+      for (let attempt = 0; attempt < 50 && !prod; attempt += 1) {
+        nextNum += 1;
+        pid = `P${nextNum}`;
+        // Auto-SKU mirrors the admin's own convention
+        // (CAT-prefix + <numeric suffix of product id> + variant index).
+        sku = skuRaw || `${String(cat._id).slice(0, 3).toUpperCase()}-${pid.slice(1)}0`;
+        variantId = `v-${pid}-0`;
+        try {
+          prod = await Product.create({
+            _id: pid,
+            cat: cat._id,
+            weave: weave || undefined,
+            name,
+            price: sellingPrice,
+            compareAt: mrp,
+            occasions,
+            occasion: occasions[0],
+            variants: [{ id: variantId, colour, hex, size, sku, imageUrls: [] }],
+            hex,
+            // zariHex drives the stripe in the admin's colour swatch.
+            // The swatch CSS is a linear-gradient of `var(--b) / var(--z)`
+            // — if --z is unset the whole gradient is invalid and the
+            // swatch renders transparent. Default to the "No zari" tone
+            // the admin drawer uses for the same case so bulk-imported
+            // products show the same visual as hand-added ones.
+            zariHex: '#d8cfbf',
+            imageUrls: [],
+            images: 0,
+            status,
+            created: new Date().toISOString().slice(0, 10),
+          });
+        } catch (err) {
+          // Duplicate _id → remember the error and probe the next number.
+          // Any other error (validation, cast, Mongo down) is real and
+          // bubbles to the outer catch so the admin sees the message.
+          if (err?.code === 11000 && String(err.message || '').includes('_id')) {
+            createPidError = err;
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (!prod) {
+        results.push({ line: i + 1, name, ok: false, error: createPidError ? `could not reserve a free product id after 50 attempts (${createPidError.message})` : 'could not reserve a free product id' });
+        continue;
+      }
+      let createdPieces = 0;
+      // Receive initial stock if the row has a qty. Mirrors the per-
+      // variant receive endpoint: pre-scan existing pieces with the same
+      // SKU prefix so numbering picks up PAST any written-off leftovers
+      // from a previous delete (cascade write-off keeps the Piece docs
+      // around for audit, which is why a naive -001 start collides and
+      // every piece throws E11000). Piece failures are non-fatal — the
+      // product stays saved and the admin can receive stock manually.
+      if (qty > 0) {
+        try {
+          const at = new Date().toISOString();
+          const existing = await Piece.find({ _id: new RegExp(`^${sku.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}-\\d{3,}$`) }).select('_id').lean();
+          let seq = existing.reduce((m, p) => {
+            const match = /-(\d{3,})$/.exec(p._id);
+            return match ? Math.max(m, Number(match[1])) : m;
+          }, 0);
+          for (let k = 0; k < qty; k += 1) {
+            seq += 1;
+            const code = `${sku}-${String(seq).padStart(3, '0')}`;
+            await Piece.create({ _id: code, pid, vid: variantId, status: 'In stock', at, received: at, printed: false });
+            await Movement.create({ _id: await nextMoveId(), code, pid, vid: variantId, from: '—', to: 'In stock', note: 'Received from the weaver (bulk product import)', oid: null, by, at });
+            createdPieces += 1;
+          }
+          await syncProductStockFromPieces(pid);
+        } catch (pieceErr) {
+          console.warn(`[products.bulk] piece creation failed for ${pid}/${sku}:`, pieceErr.message);
+          results.push({ line: i + 1, name, ok: true, pid: prod._id, sku, pieces: createdPieces, warning: `pieces partially created (${createdPieces}/${qty}): ${pieceErr.message}` });
+          continue;
+        }
+      }
+      results.push({ line: i + 1, name, ok: true, pid: prod._id, sku, pieces: createdPieces });
+    } catch (err) {
+      results.push({ line: i + 1, name, ok: false, error: err.message || 'save failed' });
+    }
+  }
+  const totals = results.reduce((a, r) => {
+    if (r.ok) { a.ok += 1; a.pieces += (r.pieces || 0); } else a.failed += 1;
+    return a;
+  }, { ok: 0, failed: 0, pieces: 0 });
+  res.status(201).json({ results, totals });
+}));
 
 // Bulk status update: PATCH /products/bulk  { ids: [], status: '...' }
 productsRouter.patch('/bulk', asyncHandler(async (req, res) => {
