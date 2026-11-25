@@ -1,11 +1,15 @@
 import mongoose from 'mongoose';
 
-// One row per homepage promotional banner. Only the Bridal Edit strip
-// (CraftStory.tsx) is admin-controlled; the Explore Collections banner
-// is static in the component. The editable fields are the image +
-// eyebrow + title + description. CTA stays hardcoded in the component.
+// One row per editorial banner — two slots are admin-controlled:
+//   - `bridal` → the Bridal Edit strip on the homepage (CraftStory.tsx).
+//   - `about`  → the hero at the top of the About page (AboutFallback).
+// The Explore Collections strip stays static in PromoBanner.tsx. The
+// enum here must stay in lockstep with ALLOWED_SLOTS in routes/
+// homeBanners.js — a slot that passes the route check but fails the
+// schema check surfaces as `Validation failed: slot: '<x>' is not a
+// valid enum value for path 'slot'` on PATCH.
 const HomeBannerSchema = new mongoose.Schema({
-  slot: { type: String, required: true, unique: true, trim: true, enum: ['bridal'] },
+  slot: { type: String, required: true, unique: true, trim: true, enum: ['bridal', 'about'] },
   image: { type: String, default: '', trim: true },
   eyebrow: { type: String, default: '', trim: true },
   title: { type: String, default: '', trim: true },

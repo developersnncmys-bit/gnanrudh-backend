@@ -11,6 +11,16 @@ const CategorySchema = new mongoose.Schema({
   visible: { type: Boolean, default: true },
   story: { type: String, default: '' },
   image: { type: String, default: '' },
+  // Editorial "Styling Notes" block rendered on the category landing
+  // page (CategoryStylingGuide on the storefront). `stylingTips` is
+  // capped at four entries by the admin form; the schema accepts any
+  // number so future expansions don't need a migration.
+  stylingTitle: { type: String, default: '' },
+  stylingIntro: { type: String, default: '' },
+  stylingTips: {
+    type: [{ title: { type: String, default: '' }, body: { type: String, default: '' } }],
+    default: [],
+  },
 }, { timestamps: true, _id: false });
 
 export const Category = mongoose.model('Category', CategorySchema);

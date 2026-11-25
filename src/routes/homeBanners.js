@@ -2,14 +2,17 @@ import { Router } from 'express';
 import { HomeBanner } from '../models/HomeBanner.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 
-// Admin router for the homepage banner. Only the Bridal Edit strip is
-// admin-controlled; the Explore Collections strip was reverted to a
-// static component (see CraftStory.tsx vs PromoBanner.tsx). The slot
-// enum below hard-rejects anything other than `bridal` so a tampered
-// request can't write a ghost row for a slot that nothing reads.
-// Keyed by `slot` instead of Mongo _id so the admin UI can PATCH by
-// slot name directly — mirrors how the frontend consumes it. Public
-// read is exposed separately in routes/public.js.
+// Admin router for the section banners. Two slots are admin-controlled:
+//   - `bridal` — the Bridal Edit strip on the homepage (CraftStory.tsx).
+//   - `about`  — the hero at the top of the /about page (AboutFallback).
+// The Explore Collections strip on the homepage was reverted to a static
+// component (PromoBanner.tsx) and is not editable here. The enum below
+// hard-rejects anything other than these two slots so a tampered request
+// can't write a ghost row for a slot that nothing reads. Keyed by `slot`
+// instead of Mongo _id so the admin UI can PATCH by slot name directly —
+// mirrors how the frontend consumes it. Public read is exposed separately
+// in routes/public.js.
+const ALLOWED_SLOTS = new Set(['bridal', 'about']);
 export const homeBannersRouter = Router();
 
 // GET /api/home-banners — list both rows for the admin screen.
@@ -22,7 +25,7 @@ homeBannersRouter.get('/', asyncHandler(async (req, res) => {
 // Upserts so a slot can be edited even if it was never seeded.
 homeBannersRouter.patch('/:slot', asyncHandler(async (req, res) => {
   const slot = String(req.params.slot || '').toLowerCase();
-  if (slot !== 'bridal') {
+  if (!ALLOWED_SLOTS.has(slot)) {
     return res.status(400).json({ error: 'Unknown banner slot' });
   }
   const patch = {};
