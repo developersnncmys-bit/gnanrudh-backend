@@ -30,11 +30,13 @@ const ProductSchema = new mongoose.Schema({
   border: { type: String, default: null },
   // CAT-04: occasions is the canonical multi-value field. `occasion` (singular) is kept
   // as a mirror of occasions[0] for backwards compatibility with storefront/admin reads.
-  occasions: {
-    type: [String],
-    default: [],
-    validate: { validator: (v) => Array.isArray(v) && v.length > 0, message: 'At least one occasion is required.' },
-  },
+  // CAT-04: occasions is a multi-value tag list that drives storefront
+  // filters. Admins can leave it empty — the product still lists in
+  // search and category views, just not in any occasion-scoped filter.
+  // The admin product form still nudges staff to pick at least one for
+  // better discoverability, but the schema no longer enforces it so
+  // bulk imports can skip the column.
+  occasions: { type: [String], default: [] },
   occasion: String,
   length: { type: String, default: null },
   width: { type: String, default: null },

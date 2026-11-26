@@ -96,7 +96,6 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
     if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) { results.push({ line: i + 1, name, ok: false, error: 'selling_price must be a positive number' }); continue; }
     if (mrp !== null && (!Number.isFinite(mrp) || mrp <= sellingPrice)) { results.push({ line: i + 1, name, ok: false, error: 'mrp must be greater than selling_price' }); continue; }
     if (!colours.length) { results.push({ line: i + 1, name, ok: false, error: 'colour is empty' }); continue; }
-    if (!occasions.length) { results.push({ line: i + 1, name, ok: false, error: 'occasions required (pipe-separated, e.g. Festive|Everyday)' }); continue; }
     const cat = byCat.get(categoryRaw.toLowerCase());
     if (!cat) { results.push({ line: i + 1, name, ok: false, error: `unknown category: ${categoryRaw}` }); continue; }
     // Align the per-variant lists to the colour count. Missing entries
@@ -143,7 +142,7 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
             price: sellingPrice,
             compareAt: mrp,
             occasions,
-            occasion: occasions[0],
+            occasion: occasions[0] || undefined,
             variants,
             // Product-level hex still reads from the first variant so
             // the admin's product-card swatch has something to show
