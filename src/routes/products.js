@@ -7,6 +7,7 @@ import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { normaliseWeaveSpelling } from '../validators.js';
 import { recordMove, syncProductStockFromPieces } from './pieces.js';
+import { resolveColourHex } from '../colours.js';
 
 // AUD-01 ties audit rows to the staff email, same convention the rest of
 // the routes use.
@@ -73,13 +74,18 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
     // enforces this on save).
     const mrpRaw = r.mrp ?? r.compareAt;
     const mrp = mrpRaw === undefined || mrpRaw === '' ? null : Number(mrpRaw);
-    const qty = Math.max(0, Number(r.qty) | 0);
-    const colour = String(r.colour || '').trim();
+    // Multi-colour support: colour / hex / size / sku / qty accept
+    // pipe-separated values that line up positionally — one variant per
+    // colour. A comma is also accepted as a separator so admins who
+    // think in commas don't trip on the pipe convention.
+    const splitList = (s) => String(s || '').split(/[|,]/).map((x) => x.trim()).filter((x) => x.length > 0);
+    const colours = splitList(r.colour);
+    const hexListRaw = splitList(r.hex);
+    const sizeList = splitList(r.size);
+    const skuListRaw = splitList(r.sku);
+    const qtyList = splitList(r.qty).map((q) => Math.max(0, parseInt(q, 10) || 0));
     const occasions = String(r.occasions || '').split('|').map((s) => s.trim()).filter(Boolean);
     const weave = String(r.weave || '').trim();
-    const hex = String(r.hex || '').trim() || '#666666';
-    const size = String(r.size || '').trim() || null;
-    const skuRaw = String(r.sku || '').trim();
     const statusRaw = String(r.status || '').trim();
     // Default to Active so bulk-uploaded sarees appear on the storefront
     // immediately. Admins who want a staging buffer can still set the row
@@ -89,10 +95,18 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
     if (!categoryRaw) { results.push({ line: i + 1, name, ok: false, error: 'category is empty' }); continue; }
     if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) { results.push({ line: i + 1, name, ok: false, error: 'selling_price must be a positive number' }); continue; }
     if (mrp !== null && (!Number.isFinite(mrp) || mrp <= sellingPrice)) { results.push({ line: i + 1, name, ok: false, error: 'mrp must be greater than selling_price' }); continue; }
-    if (!colour) { results.push({ line: i + 1, name, ok: false, error: 'colour is empty' }); continue; }
+    if (!colours.length) { results.push({ line: i + 1, name, ok: false, error: 'colour is empty' }); continue; }
     if (!occasions.length) { results.push({ line: i + 1, name, ok: false, error: 'occasions required (pipe-separated, e.g. Festive|Everyday)' }); continue; }
     const cat = byCat.get(categoryRaw.toLowerCase());
     if (!cat) { results.push({ line: i + 1, name, ok: false, error: `unknown category: ${categoryRaw}` }); continue; }
+    // Align the per-variant lists to the colour count. Missing entries
+    // repeat the LAST supplied value — so `qty=500` with 3 colours gives
+    // 500 to every variant, while `qty=500|300|200` sets each one.
+    const pad = (list, fallback) => colours.map((_, idx) => (list[idx] !== undefined ? list[idx] : (list.length ? list[list.length - 1] : fallback)));
+    const hexList = pad(hexListRaw, '').map((h, idx) => resolveColourHex(h || colours[idx]));
+    const sizesPadded = pad(sizeList, '');
+    const skusPadded = pad(skuListRaw, '');
+    const qtysPadded = qtyList.length ? pad(qtyList, 0) : colours.map(() => 0);
     try {
       // Reserve a fresh P-id. If the computed pid collides with an
       // existing row (prior bulk run, leftover from a partial failure,
@@ -103,16 +117,23 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
       // on the same collision.
       let prod = null;
       let pid = '';
-      let sku = '';
-      let variantId = '';
+      let variants = [];
       let createPidError = null;
       for (let attempt = 0; attempt < 50 && !prod; attempt += 1) {
         nextNum += 1;
         pid = `P${nextNum}`;
+        const catPrefix = String(cat._id).slice(0, 3).toUpperCase();
+        // One variant per colour; each gets its own vid and SKU.
         // Auto-SKU mirrors the admin's own convention
         // (CAT-prefix + <numeric suffix of product id> + variant index).
-        sku = skuRaw || `${String(cat._id).slice(0, 3).toUpperCase()}-${pid.slice(1)}0`;
-        variantId = `v-${pid}-0`;
+        variants = colours.map((col, idx) => ({
+          id: `v-${pid}-${idx}`,
+          colour: col,
+          hex: hexList[idx],
+          size: sizesPadded[idx] || null,
+          sku: (skusPadded[idx] || '') || `${catPrefix}-${pid.slice(1)}${idx}`,
+          imageUrls: [],
+        }));
         try {
           prod = await Product.create({
             _id: pid,
@@ -123,8 +144,11 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
             compareAt: mrp,
             occasions,
             occasion: occasions[0],
-            variants: [{ id: variantId, colour, hex, size, sku, imageUrls: [] }],
-            hex,
+            variants,
+            // Product-level hex still reads from the first variant so
+            // the admin's product-card swatch has something to show
+            // before a shopper picks a colour.
+            hex: variants[0].hex,
             // zariHex drives the stripe in the admin's colour swatch.
             // The swatch CSS is a linear-gradient of `var(--b) / var(--z)`
             // — if --z is unset the whole gradient is invalid and the
@@ -160,64 +184,69 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
       // around for audit, which is why a naive -001 start collides and
       // every piece throws E11000). Piece failures are non-fatal — the
       // product stays saved and the admin can receive stock manually.
-      if (qty > 0) {
+      const totalQty = qtysPadded.reduce((a, q) => a + q, 0);
+      if (totalQty > 0) {
         try {
           const at = new Date().toISOString();
-          const existing = await Piece.find({ _id: new RegExp(`^${sku.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}-\\d{3,}$`) }).select('_id').lean();
-          let seq = existing.reduce((m, p) => {
-            const match = /-(\d{3,})$/.exec(p._id);
-            return match ? Math.max(m, Number(match[1])) : m;
-          }, 0);
-
-          // PERF: batch the inserts. The old per-piece Piece.create +
-          // Movement.create + nextMoveId() loop hit the DB ~2 × qty + qty
-          // times (4,000+ round-trips for qty=2000), which times out on
-          // Vercel's serverless functions. We now:
-          //   1. Compute the movement-id base ONCE per batch.
-          //   2. Build piece + movement arrays in memory.
-          //   3. Push them to Mongo in chunks via insertMany so the big
-          //      imports fit inside the function's wall-clock budget.
+          // Movement-id base is read ONCE and incremented per-piece
+          // across all variants so numbering stays contiguous even when
+          // one row creates variants with mixed qty.
           const CHUNK = 500;
-          const moveBase = await Movement.estimatedDocumentCount();
+          let moveBase = await Movement.estimatedDocumentCount();
           const batchStamp = Date.now().toString(36);
-          const pieceDocs = [];
-          const moveDocs = [];
-          for (let k = 0; k < qty; k += 1) {
-            seq += 1;
-            const code = `${sku}-${String(seq).padStart(3, '0')}`;
-            pieceDocs.push({ _id: code, pid, vid: variantId, status: 'In stock', at, received: at, printed: false });
-            // Movement _id is schema-required string. Combining the running
-            // sequence base with the batch timestamp and the per-piece
-            // index guarantees uniqueness inside this batch AND across
-            // concurrent bulk uploads landing in the same second.
-            const moveId = `MV${moveBase + k + 1}${batchStamp}${k.toString(36)}`;
-            moveDocs.push({
-              _id: moveId,
-              code, pid, vid: variantId,
-              from: '—', to: 'In stock',
-              note: 'Received from the weaver (bulk product import)',
-              oid: null, by, at,
-            });
+          const allPieceDocs = [];
+          const allMoveDocs = [];
+          let globalK = 0;
+          for (let vIdx = 0; vIdx < variants.length; vIdx += 1) {
+            const v = variants[vIdx];
+            const vQty = qtysPadded[vIdx] || 0;
+            if (vQty <= 0) continue;
+            // Pre-scan existing pieces for this variant's SKU so numbering
+            // picks up PAST any written-off leftovers from a previous
+            // delete (cascade write-off keeps the Piece docs around for
+            // audit, which is why a naive -001 start collides).
+            const existing = await Piece.find({ _id: new RegExp(`^${v.sku.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}-\\d{3,}$`) }).select('_id').lean();
+            let seq = existing.reduce((m, p) => {
+              const match = /-(\d{3,})$/.exec(p._id);
+              return match ? Math.max(m, Number(match[1])) : m;
+            }, 0);
+            for (let k = 0; k < vQty; k += 1) {
+              seq += 1;
+              const code = `${v.sku}-${String(seq).padStart(3, '0')}`;
+              allPieceDocs.push({ _id: code, pid, vid: v.id, status: 'In stock', at, received: at, printed: false });
+              // Movement _id combines the running sequence base, the batch
+              // timestamp and the running index so it's unique within this
+              // batch AND across concurrent uploads in the same second.
+              const moveId = `MV${moveBase + globalK + 1}${batchStamp}${globalK.toString(36)}`;
+              allMoveDocs.push({
+                _id: moveId,
+                code, pid, vid: v.id,
+                from: '—', to: 'In stock',
+                note: 'Received from the weaver (bulk product import)',
+                oid: null, by, at,
+              });
+              globalK += 1;
+            }
           }
-          for (let off = 0; off < pieceDocs.length; off += CHUNK) {
-            const pieceSlice = pieceDocs.slice(off, off + CHUNK);
-            const moveSlice = moveDocs.slice(off, off + CHUNK);
+          for (let off = 0; off < allPieceDocs.length; off += CHUNK) {
+            const pieceSlice = allPieceDocs.slice(off, off + CHUNK);
+            const moveSlice = allMoveDocs.slice(off, off + CHUNK);
             // ordered: false — a lone collision (e.g. a legacy piece
             // number sneaked in between our scan and insert) keeps the
             // rest of the batch moving. Count only the pieces that
-            // actually landed by inspecting insertedCount / insertedIds.
+            // actually landed by inspecting insertedCount.
             const pRes = await Piece.insertMany(pieceSlice, { ordered: false, rawResult: true });
             createdPieces += pRes.insertedCount ?? pieceSlice.length;
             await Movement.insertMany(moveSlice, { ordered: false });
           }
           await syncProductStockFromPieces(pid);
         } catch (pieceErr) {
-          console.warn(`[products.bulk] piece creation failed for ${pid}/${sku}:`, pieceErr.message);
-          results.push({ line: i + 1, name, ok: true, pid: prod._id, sku, pieces: createdPieces, warning: `pieces partially created (${createdPieces}/${qty}): ${pieceErr.message}` });
+          console.warn(`[products.bulk] piece creation failed for ${pid}:`, pieceErr.message);
+          results.push({ line: i + 1, name, ok: true, pid: prod._id, variants: variants.length, pieces: createdPieces, warning: `pieces partially created (${createdPieces}/${totalQty}): ${pieceErr.message}` });
           continue;
         }
       }
-      results.push({ line: i + 1, name, ok: true, pid: prod._id, sku, pieces: createdPieces });
+      results.push({ line: i + 1, name, ok: true, pid: prod._id, variants: variants.length, pieces: createdPieces });
     } catch (err) {
       results.push({ line: i + 1, name, ok: false, error: err.message || 'save failed' });
     }
