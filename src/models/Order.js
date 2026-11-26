@@ -54,6 +54,15 @@ const OrderSchema = new mongoose.Schema({
   // RET-01: set when Shiprocket's Delivered webhook lands (or manual "mark delivered").
   // Returns compute eligibility from this + Settings.policy.window.
   deliveredAt: { type: String, default: null },
+  // GST-05: B2B invoicing. When the shopper ticks "I need a GST invoice"
+  // at checkout (or an admin fills it in on a walk-in order), the GSTIN
+  // + business name + billing address land here. The invoice template
+  // flips "Customer type" to Registered when `billingGstin` is set and
+  // shows the GSTIN under "Billed to" so the buyer can claim input tax
+  // credit. All three fields are optional — B2C orders leave them blank.
+  billingGstin: { type: String, default: '' },
+  billingName: { type: String, default: '' },
+  billingAddress: { type: String, default: '' },
 }, { timestamps: true, _id: false });
 
 // PERF-01: compound indexes for the hot dashboard + listing queries.

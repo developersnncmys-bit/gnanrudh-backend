@@ -120,6 +120,21 @@ customerPaymentRouter.post('/orders', requireAuth, requireCustomer, asyncHandler
   const tax = Math.round(taxable * GST_RATE);
   const total = taxable + tax;
 
+  // GST-05: pull the optional B2B invoicing fields and validate format
+  // server-side. A tampered client that sends an invalid GSTIN is
+  // rejected so the invoice doesn't print a bogus number.
+  const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9][A-Z][0-9A-Z]$/;
+  const rawGstin = typeof body.billingGstin === 'string' ? body.billingGstin.trim().toUpperCase() : '';
+  if (rawGstin && !GSTIN_RE.test(rawGstin)) {
+    return res.status(400).json({ error: 'billingGstin must be 15 characters in the standard format' });
+  }
+  const billingGstin = rawGstin;
+  const billingName = billingGstin ? String(body.billingName || '').trim() : '';
+  const billingAddress = billingGstin ? String(body.billingAddress || '').trim() : '';
+  if (billingGstin && !billingName) {
+    return res.status(400).json({ error: 'billingName is required when billingGstin is set' });
+  }
+
   const order = await Order.create({
     _id: newOrderId(),
     placed: new Date().toISOString(),
@@ -143,6 +158,9 @@ customerPaymentRouter.post('/orders', requireAuth, requireCustomer, asyncHandler
       awb: null,
     },
     source: 'Storefront',
+    billingGstin,
+    billingName,
+    billingAddress,
   });
 
   // Reserve pieces now so the user's variants aren't sold during the

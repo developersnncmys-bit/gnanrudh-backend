@@ -6,7 +6,7 @@ import { Category } from '../models/Category.js';
 import { crudRouter } from './_crud.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { normaliseWeaveSpelling } from '../validators.js';
-import { recordMove, syncProductStockFromPieces } from './pieces.js';
+import { nextMoveId, syncProductStockFromPieces } from './pieces.js';
 import { resolveColourHex } from '../colours.js';
 
 // AUD-01 ties audit rows to the staff email, same convention the rest of
@@ -272,29 +272,43 @@ productsRouter.patch('/bulk', asyncHandler(async (req, res) => {
 // Piece pointing at a now-missing pid — which is exactly how the Barcodes
 // & stock page ended up showing "Deleted product · In stock" rows that
 // inflated inventory counters without ever being sellable. The audit
-// trail is preserved: each Piece transition is recorded via `recordMove`
-// (same helper the receive / pack / ship flows use) with the deletion as
-// the explicit reason, so staff can trace where the units went.
+// trail is preserved: each Piece transition is written to Movement with
+// the deletion as the explicit reason, so staff can trace where the
+// units went. We batch with insertMany + updateMany so a 2000-piece
+// product deletes in two round-trips instead of 4000.
 productsRouter.delete('/:id', asyncHandler(async (req, res) => {
   const id = req.params.id;
   const p = await Product.findById(id);
   if (!p) return res.status(404).json({ error: 'Product not found' });
   // Only outstanding pieces need transitioning — Sold / Returned / Written
   // off are already in a terminal state and should keep their current
-  // audit history untouched.
+  // audit history untouched. Snapshot them first so we can write the
+  // audit trail with the correct `from` status before flipping.
   const outstanding = await Piece.find({
     pid: id,
     status: { $in: ['In stock', 'Reserved', 'Packed'] },
-  });
+  }).lean();
   const by = byFromReq(req);
-  for (const piece of outstanding) {
+  const at = new Date().toISOString();
+  const note = `Product deleted: ${p.name}`;
+  if (outstanding.length) {
+    // Bulk audit rows first — one insertMany instead of N Movement.create
+    // calls. Unique _ids come from nextMoveId() which is DB-free.
+    const moves = await Promise.all(outstanding.map(async (piece) => ({
+      _id: await nextMoveId(),
+      code: piece._id, pid: piece.pid, vid: piece.vid,
+      from: piece.status, to: 'Written off', note, oid: null, by, at,
+    })));
     try {
-      await recordMove(piece, 'Written off', `Product deleted: ${p.name}`, { by, oid: null });
+      await Movement.insertMany(moves, { ordered: false });
     } catch (err) {
-      // Keep going on single-piece failures so the admin isn't left with a
-      // half-cleaned product. The failure surfaces in server logs.
-      console.warn(`[products.delete] piece ${piece._id} write-off failed:`, err.message);
+      console.warn(`[products.delete] bulk audit write failed:`, err.message);
     }
+    // Single updateMany flips all 2000 pieces to 'Written off' in one shot.
+    await Piece.updateMany(
+      { _id: { $in: outstanding.map((piece) => piece._id) } },
+      { $set: { status: 'Written off', oid: null, at } },
+    );
   }
   // Keep the denormalised variant.stock counters in sync so reports don't
   // keep showing a phantom "N in stock" on the (now deleted) product.

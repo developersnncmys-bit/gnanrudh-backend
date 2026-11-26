@@ -28,6 +28,7 @@ import { piecesRouter, movementsRouter, recordMove } from './routes/pieces.js';
 import { Piece } from './models/Piece.js';
 import { Product } from './models/Product.js';
 import { authRouter } from './routes/auth.js';
+import { teamRouter } from './routes/team.js';
 import { customerAuthRouter } from './routes/customerAuth.js';
 import { customerPaymentRouter } from './routes/customerPayment.js';
 import { webhooksRouter } from './routes/webhooks.js';
@@ -97,6 +98,7 @@ app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '7d', immutable: true }
 // Public endpoints
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.use('/api/auth', authRouter);
+app.use('/api/team', teamRouter);
 app.use('/api/customer-auth', customerAuthRouter);
 app.use('/api/customer-auth', customerPaymentRouter);
 app.use('/api/public', publicRouter);

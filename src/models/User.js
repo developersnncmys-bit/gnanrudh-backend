@@ -13,6 +13,16 @@ const UserSchema = new mongoose.Schema({
   name: { type: String, default: '' },
   role: { type: String, enum: ROLES, default: 'manager' },
   lastLoginAt: { type: Date, default: null },
+  // SEC-03 team management:
+  //  - `disabled` is a soft-ban. Disabled users can't log in and their
+  //    existing tokens are rejected on the next request.
+  //  - `tokenInvalidBefore` is bumped whenever an owner resets the user's
+  //    password or disables them. requireAuth rejects any token whose
+  //    `iat` (issued-at) falls before this timestamp, so a disabled or
+  //    just-reset user can't keep using the token that was in their
+  //    browser a moment ago.
+  disabled: { type: Boolean, default: false },
+  tokenInvalidBefore: { type: Date, default: null },
 }, { timestamps: true });
 
 // TODO (SEC-03): existing seeded users have role 'admin' or 'staff' from the old enum.

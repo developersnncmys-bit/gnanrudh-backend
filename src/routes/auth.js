@@ -24,6 +24,14 @@ authRouter.post('/login', loginLimit, asyncHandler(async (req, res) => {
     return res.status(401).json({ error: 'Incorrect email or password' });
   }
 
+  // SEC-03: disabled users can authenticate (correct password) but can't
+  // log in. Message deliberately generic so an attacker can't tell the
+  // difference between "wrong password" and "disabled account".
+  if (user.disabled) {
+    await recordLoginFailure(req.loginAttempt);
+    return res.status(401).json({ error: 'Incorrect email or password' });
+  }
+
   user.lastLoginAt = new Date();
   await user.save();
 
