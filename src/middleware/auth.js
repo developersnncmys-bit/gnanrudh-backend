@@ -1,87 +1,260 @@
+
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
 import { User } from '../models/User.js';
 import { Session } from '../models/Session.js';
 
-// `sid` is optional so legacy pre-session tokens still verify — they just
-// won't have per-device sign-out (they fall through the Session check in
-// requireAuth below). Once every live token has rolled over past expiry
-// this fallback can go.
+// Update session activity at most once per minute.
+const SESSION_ACTIVITY_INTERVAL = 60 * 1000;
+
+// Generate JWT token.
 export function signToken(user, sid) {
   return jwt.sign(
-    { sub: user._id.toString(), email: user.email, role: user.role, sid: sid || undefined },
+    {
+      sub: user._id.toString(),
+      email: user.email,
+      role: user.role,
+      sid: sid || undefined,
+    },
     config.jwtSecret,
-    { expiresIn: config.jwtExpiresIn },
+    {
+      algorithm: 'HS256',
+      expiresIn: config.jwtExpiresIn,
+    }
   );
 }
 
+// Authentication middleware.
 export async function requireAuth(req, res, next) {
+  const startedAt = Date.now();
+
   const header = req.headers.authorization || '';
   const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || !token) return res.status(401).json({ error: 'Missing bearer token' });
-  try {
-    const payload = jwt.verify(token, config.jwtSecret, { algorithms: ['HS256'] });
 
-    // SEC-03: look up the user doc so we can enforce the `disabled` flag
-    // and the `tokenInvalidBefore` watermark bumped by password resets /
-    // role changes. One lean projection per authed request — cheap enough
-    // for an admin-panel-scale workload. If this ever becomes a hot path,
-    // cache per-sub in memory with a short TTL.
-    // Customer tokens carry a string Customer._id in `sub`; User._id is an
-    // ObjectId, so a User.findById on a customer sub throws a CastError
-    // and lands in the Invalid-token branch below — breaking every
-    // customer-auth route. requireCustomer re-validates the customer doc
-    // (and its own tokenInvalidBefore) downstream, so for customer tokens
-    // we skip the User lookup here entirely.
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({
+      error: 'Missing bearer token',
+    });
+  }
+
+  let payload;
+
+  // Verify JWT separately from database operations.
+  try {
+    payload = jwt.verify(token, config.jwtSecret, {
+      algorithms: ['HS256'],
+    });
+
+    if (
+      !payload ||
+      typeof payload !== 'object' ||
+      !payload.sub
+    ) {
+      return res.status(401).json({
+        error: 'Invalid token',
+      });
+    }
+  } catch (err) {
+    return res.status(401).json({
+      error:
+        err.name === 'TokenExpiredError'
+          ? 'Token expired'
+          : 'Invalid token',
+    });
+  }
+
+  try {
+    // Customer tokens are validated downstream
+    // by the existing requireCustomer middleware.
     if (payload.role !== 'customer') {
-      // SEC-05: load the per-user permissions override too. Empty array
-      // (the default) means "fall back to role defaults" — permsFor()
-      // handles the resolution.
-      const u = await User.findById(payload.sub).select('disabled tokenInvalidBefore permissions role').lean();
-      if (!u) return res.status(401).json({ error: 'User no longer exists' });
-      if (u.disabled) return res.status(401).json({ error: 'This account has been disabled' });
-      if (u.tokenInvalidBefore && payload.iat && (payload.iat * 1000) < new Date(u.tokenInvalidBefore).getTime()) {
-        return res.status(401).json({ error: 'Session ended, please sign in again' });
+      const userStartedAt = Date.now();
+
+      // Fetch only required user fields.
+      const user = await User.findById(payload.sub)
+        .select('disabled tokenInvalidBefore permissions role')
+        .lean()
+        .maxTimeMS(5000);
+
+      console.log(
+        `[auth] User lookup: ${Date.now() - userStartedAt}ms`
+      );
+
+      if (!user) {
+        return res.status(401).json({
+          error: 'User no longer exists',
+        });
       }
-      // SEC-06: per-device session check. If the token carries a `sid`,
-      // the matching Session must still exist and belong to this user.
-      // Revoking a session (via DELETE /auth/sessions/:id) deletes the
-      // Session doc, which makes every subsequent request fail here with
-      // a clear "signed out" message.
+
+      if (user.disabled) {
+        return res.status(401).json({
+          error: 'This account has been disabled',
+        });
+      }
+
+      // Enforce token invalidation after password
+      // resets or role changes.
+      if (
+        user.tokenInvalidBefore &&
+        payload.iat &&
+        payload.iat * 1000 <
+          new Date(user.tokenInvalidBefore).getTime()
+      ) {
+        return res.status(401).json({
+          error: 'Session ended, please sign in again',
+        });
+      }
+
+      // Validate per-device session.
       if (payload.sid) {
-        const session = await Session.findOne({ _id: payload.sid, uid: payload.sub }).lean();
-        if (!session) return res.status(401).json({ error: 'Signed out on this device' });
-        // Non-blocking: update lastActiveAt so the Admin > Signed-in
-        // devices list orders by recency. Any failure is swallowed —
-        // the request already succeeded from the auth side.
-        Session.updateOne({ _id: payload.sid }, { $set: { lastActiveAt: new Date() } }).catch(() => {});
+        const sessionStartedAt = Date.now();
+
+        const session = await Session.findOne({
+          _id: payload.sid,
+          uid: payload.sub,
+        })
+          .select('_id lastActiveAt')
+          .lean()
+          .maxTimeMS(5000);
+
+        console.log(
+          `[auth] Session lookup: ${
+            Date.now() - sessionStartedAt
+          }ms`
+        );
+
+        if (!session) {
+          return res.status(401).json({
+            error: 'Signed out on this device',
+          });
+        }
+
+        const now = Date.now();
+
+        const lastActiveAt = session.lastActiveAt
+          ? new Date(session.lastActiveAt).getTime()
+          : 0;
+
+        // Avoid unnecessary database writes.
+        if (
+          !lastActiveAt ||
+          now - lastActiveAt >= SESSION_ACTIVITY_INTERVAL
+        ) {
+          try {
+            await Session.updateOne(
+              {
+                _id: payload.sid,
+                uid: payload.sub,
+                $or: [
+                  {
+                    lastActiveAt: {
+                      $lte: new Date(
+                        now - SESSION_ACTIVITY_INTERVAL
+                      ),
+                    },
+                  },
+                  {
+                    lastActiveAt: { $exists: false },
+                  },
+                  {
+                    lastActiveAt: null,
+                  },
+                ],
+              },
+              {
+                $set: {
+                  lastActiveAt: new Date(now),
+                },
+              }
+            ).maxTimeMS(2000);
+          } catch (err) {
+            // Activity tracking failure must not
+            // invalidate an otherwise valid session.
+            console.warn(
+              '[auth] Session activity update failed:',
+              err.message
+            );
+          }
+        }
       }
-      payload.permissions = Array.isArray(u.permissions) ? u.permissions : [];
-      // The DB is the source of truth for role too — a token minted before
-      // a role change would otherwise keep the old privileges until expiry.
-      payload.role = u.role || payload.role;
+
+      // Use current permissions from the database.
+      payload.permissions = Array.isArray(user.permissions)
+        ? user.permissions
+        : [];
+
+      // Use the current database role.
+      payload.role = user.role || payload.role;
     }
 
     req.user = payload;
-    // SEC-03: sliding window refresh. If the token has less than the configured
-    // threshold left, issue a fresh one and send it via a response header so the
-    // client can rotate without the user noticing. Carries the sid forward so
-    // the refreshed token stays attached to the same device session.
+
+    // Sliding-window JWT refresh.
     const now = Math.floor(Date.now() / 1000);
-    if (payload.exp && (payload.exp - now) < config.jwtRefreshThresholdSec) {
-      const next = signToken({ _id: payload.sub, email: payload.email, role: payload.role }, payload.sid);
-      res.setHeader('X-Refreshed-Token', next);
+
+    if (
+      payload.exp &&
+      payload.exp - now < config.jwtRefreshThresholdSec
+    ) {
+      const refreshedToken = signToken(
+        {
+          _id: payload.sub,
+          email: payload.email,
+          role: payload.role,
+        },
+        payload.sid
+      );
+
+      res.setHeader(
+        'X-Refreshed-Token',
+        refreshedToken
+      );
     }
-    next();
+
+    console.log(
+      `[auth] ${req.method} ${req.path} completed in ${
+        Date.now() - startedAt
+      }ms`
+    );
+
+    return next();
+
   } catch (err) {
-    return res.status(401).json({ error: err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token' });
+    console.error('[auth] Authentication error:', {
+      name: err.name,
+      message: err.message,
+      path: req.path,
+      duration: Date.now() - startedAt,
+    });
+
+    if (err.name === 'CastError') {
+      return res.status(401).json({
+        error: 'Invalid token',
+      });
+    }
+
+    // Database outages must not be treated
+    // as invalid authentication tokens.
+    return res.status(503).json({
+      error: 'Authentication service temporarily unavailable',
+    });
   }
 }
 
+// Role-based authorization middleware.
 export function requireRole(...roles) {
   return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
-    if (!roles.includes(req.user.role)) return res.status(403).json({ error: 'Not allowed' });
-    next();
+    if (!req.user) {
+      return res.status(401).json({
+        error: 'Not authenticated',
+      });
+    }
+
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({
+        error: 'Not allowed',
+      });
+    }
+
+    return next();
   };
 }

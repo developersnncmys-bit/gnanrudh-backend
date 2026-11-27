@@ -3,20 +3,36 @@ import { config } from './config.js';
 
 mongoose.set('strictQuery', true);
 
+const cached = globalThis.__mongoCache ??= {
+  conn: null,
+  promise: null,
+};
+
 export async function connectDB() {
-  if (globalThis.__mongoConn) return globalThis.__mongoConn;
-  if (!globalThis.__mongoConnPromise) {
-    // PERF-01: bound the pool so a serverless cold-start burst doesn't open 100 sockets
-    // and so a single function instance doesn't starve others on the cluster. 10 is safe
-    // for a Mongo M10 (hard cap 1,500) with dozens of concurrent function instances.
-    globalThis.__mongoConnPromise = mongoose.connect(config.mongoUri, {
+  if (cached.conn && mongoose.connection.readyState === 1) {
+    return cached.conn;
+  }
+
+  if (!cached.promise) {
+    cached.promise = mongoose.connect(config.mongoUri, {
       maxPoolSize: 10,
+      minPoolSize: 0,
       serverSelectionTimeoutMS: 5000,
-    }).then((conn) => {
-      globalThis.__mongoConn = conn;
-      console.log(`[db] connected`);
-      return conn;
+      connectTimeoutMS: 5000,
+      socketTimeoutMS: 15000,
+      waitQueueTimeoutMS: 5000,
+      maxIdleTimeMS: 60000,
     });
   }
-  return globalThis.__mongoConnPromise;
+
+  try {
+    cached.conn = await cached.promise;
+    return cached.conn;
+  } catch (error) {
+    cached.conn = null;
+    console.error('[MongoDB Error]', error.message);
+    throw error;
+  } finally {
+    cached.promise = null;
+  }
 }
