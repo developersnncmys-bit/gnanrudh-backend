@@ -111,27 +111,50 @@ export function getMatrix() {
   return cachedMatrix || normaliseMatrix(DEFAULT_ROLE_PERMISSIONS);
 }
 
-export function hasPerm(role, perm) {
+// Resolve a user's effective permission list. Takes the User doc (or a
+// shape with { role, permissions }). Rules:
+//   1. Owners always have every permission — no stored list can lock
+//      them out.
+//   2. If the user has a non-empty `permissions` array, that's
+//      authoritative. Admins edit this directly from the Team tab's
+//      Invite / Edit dialogs.
+//   3. Otherwise fall back to the role's default list from the live
+//      matrix (cachedMatrix) which is seeded from DEFAULT_ROLE_PERMISSIONS.
+export function permsFor(user) {
+  if (!user || !user.role) return [];
+  if (user.role === 'owner') return [...ALL_PERMISSIONS];
+  const stored = Array.isArray(user.permissions) ? user.permissions.filter((p) => ALL_PERMISSIONS.includes(p)) : [];
+  if (stored.length) return [...new Set(stored)];
   const matrix = cachedMatrix || DEFAULT_ROLE_PERMISSIONS;
-  const list = matrix[role];
-  if (!list) return false;
-  return list.includes(perm);
+  return matrix[user.role] ? [...matrix[user.role]] : [];
 }
 
-export function permsFor(role) {
-  const matrix = cachedMatrix || DEFAULT_ROLE_PERMISSIONS;
-  return matrix[role] ? [...matrix[role]] : [];
+export function hasPerm(user, perm) {
+  // Back-compat: historical callers passed `role` as a plain string. Wrap
+  // to the user-shaped resolver so both forms work.
+  const u = typeof user === 'string' ? { role: user, permissions: [] } : user;
+  return permsFor(u).includes(perm);
 }
 
-// Express middleware: reject with 403 if the signed-in user's role doesn't
-// grant `perm`. Must run AFTER requireAuth (which populates req.user).
+// Validate + sanitise a permissions array coming off the wire. Drops
+// unknown keys and dedupes. Does NOT force owner = all — the caller
+// (routes/team.js) controls that so a mid-request role change is
+// reflected consistently.
+export function sanitisePermissions(raw) {
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(raw.filter((p) => typeof p === 'string' && ALL_PERMISSIONS.includes(p)))];
+}
+
+// Express middleware: reject with 403 if the signed-in user doesn't have
+// `perm`. Must run AFTER requireAuth (which populates req.user with the
+// loaded user doc including `permissions`).
 export function requirePerm(perm) {
   return (req, res, next) => {
-    const role = req.user?.role;
-    if (!role) return res.status(401).json({ error: 'Not authenticated' });
-    if (!hasPerm(role, perm)) {
+    const u = req.user;
+    if (!u?.role) return res.status(401).json({ error: 'Not authenticated' });
+    if (!permsFor(u).includes(perm)) {
       return res.status(403).json({
-        error: `Your role (${role}) doesn't have access to ${perm}.`,
+        error: `Your account doesn't have access to ${perm}.`,
       });
     }
     next();

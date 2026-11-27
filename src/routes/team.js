@@ -17,14 +17,13 @@ import bcrypt from 'bcryptjs';
 import { User, ROLES } from '../models/User.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
-import { PERMISSIONS, DEFAULT_ROLE_PERMISSIONS, getMatrix, setMatrix } from '../permissions.js';
+import { PERMISSIONS, DEFAULT_ROLE_PERMISSIONS, sanitisePermissions, permsFor } from '../permissions.js';
 
 export const teamRouter = Router();
 
-// GET /team/role-permissions — the live role→permissions matrix plus the
-// permission catalogue (key → description) so the Settings > Team tab can
-// render the matrix. Any signed-in user can read; the data is self-
-// describing documentation, not sensitive.
+// GET /team/role-permissions — the permission catalogue + the per-role
+// defaults. Used by the admin's Invite / Edit dialogs to render checkbox
+// groups; any signed-in user can read.
 teamRouter.get(
   '/role-permissions',
   requireAuth,
@@ -32,35 +31,22 @@ teamRouter.get(
     res.json({
       permissions: PERMISSIONS, // { key: description }
       roles: Object.keys(DEFAULT_ROLE_PERMISSIONS),
-      matrix: getMatrix(),
+      // Role defaults — used by the Invite dialog to prefill the
+      // checkbox group when the admin picks a role. Per-user overrides
+      // are stored on the User doc; this endpoint doesn't expose them
+      // (fetch the user via /team to see their stored permissions).
+      defaults: Object.fromEntries(
+        Object.entries(DEFAULT_ROLE_PERMISSIONS).map(([role, perms]) => [role, [...perms]]),
+      ),
     });
   }),
 );
 
-// PUT /team/role-permissions — owner-only. Replaces the full matrix.
-// Body: { matrix: { owner: [perm, ...], manager: [...], packer: [...], support: [...] } }
-// The owner row is force-set to all permissions on write (see permissions.js
-// normaliseMatrix) so a bad edit can't lock the admin out.
-teamRouter.put(
-  '/role-permissions',
-  requireAuth,
-  requireRole('owner'),
-  asyncHandler(async (req, res) => {
-    const next = req.body?.matrix;
-    if (!next || typeof next !== 'object') {
-      return res.status(400).json({ error: 'matrix is required and must be an object keyed by role.' });
-    }
-    try {
-      const saved = await setMatrix(next);
-      res.json({ matrix: saved });
-    } catch (err) {
-      return res.status(err.status || 500).json({ error: err.message || 'Could not save permissions.' });
-    }
-  }),
-);
-
 // Strip the passwordHash from any response. Nothing else on the admin
-// client should ever see it.
+// client should ever see it. Exposes BOTH the stored per-user override
+// (`permissions`, possibly empty) AND the effective list the user ends up
+// with after permsFor() resolution — the Invite / Edit dialogs need the
+// stored form to prefill checkboxes; everything else reads `effective`.
 function publicUser(u) {
   if (!u) return null;
   return {
@@ -72,6 +58,8 @@ function publicUser(u) {
     lastLoginAt: u.lastLoginAt || null,
     createdAt: u.createdAt || null,
     updatedAt: u.updatedAt || null,
+    permissions: Array.isArray(u.permissions) ? u.permissions : [],
+    effectivePermissions: permsFor(u),
   };
 }
 
@@ -92,10 +80,11 @@ teamRouter.get(
 );
 
 // POST /team — invite a new admin.
-// Body: { email, name?, role, password }
+// Body: { email, name?, role, password, permissions? }
 // Password is set by the owner at invite time and shared out-of-band; a
 // proper email-invite flow can replace this later without changing the
-// client contract.
+// client contract. `permissions` is the per-user override — unknown keys
+// are dropped; empty array means "use role defaults".
 teamRouter.post(
   '/',
   requireAuth,
@@ -105,13 +94,14 @@ teamRouter.post(
     const name = String(req.body?.name || '').trim();
     const role = String(req.body?.role || '').trim();
     const password = String(req.body?.password || '');
+    const permissions = sanitisePermissions(req.body?.permissions);
     if (!validEmail(email)) return res.status(400).json({ error: 'A valid email is required' });
     if (!ROLES.includes(role)) return res.status(400).json({ error: `role must be one of: ${ROLES.join(', ')}` });
     if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     const exists = await User.findOne({ email }).lean();
     if (exists) return res.status(409).json({ error: 'A user with that email already exists' });
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await User.create({ email, name, role, passwordHash });
+    const user = await User.create({ email, name, role, passwordHash, permissions });
     res.status(201).json(publicUser(user.toObject()));
   }),
 );
@@ -152,6 +142,12 @@ teamRouter.patch(
       }
       if (wantDisabled && !target.disabled) target.tokenInvalidBefore = new Date();
       target.disabled = wantDisabled;
+    }
+    // SEC-05: per-user permission override. Only touched when the client
+    // explicitly sends the key (undefined means "don't change it", empty
+    // array means "clear override and fall back to role defaults").
+    if (body.permissions !== undefined) {
+      target.permissions = sanitisePermissions(body.permissions);
     }
     await target.save();
     res.json(publicUser(target.toObject()));

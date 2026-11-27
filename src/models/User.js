@@ -23,6 +23,12 @@ const UserSchema = new mongoose.Schema({
   //    browser a moment ago.
   disabled: { type: Boolean, default: false },
   tokenInvalidBefore: { type: Date, default: null },
+  // SEC-05: per-user permission override. Empty array = use the role's
+  // default permission list (ROLE_PERMISSIONS[role] in permissions.js).
+  // Non-empty = authoritative list for this user, ignoring the role.
+  // Owners always get every permission regardless of what's stored here —
+  // enforced server-side in permsFor().
+  permissions: { type: [String], default: [] },
 }, { timestamps: true });
 
 // TODO (SEC-03): existing seeded users have role 'admin' or 'staff' from the old enum.
