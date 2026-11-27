@@ -106,6 +106,17 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
     // the drawer later. The storefront's filter rail shows these under
     // the "None" chip; shoppers see the card but can't buy until a
     // variant is added.
+    //
+    // Exception: qty > 0 on a colour-less row. Pieces must attach to
+    // some variant (Piece.vid is required), so we auto-create a single
+    // "no colour" variant with an empty colour string. The admin
+    // drawer renders this as a plain Stock row — no swatch, no colour
+    // label — so the product reads as "no variant" even though the
+    // data model still has one underneath.
+    const noColourProduct = !colours.length && qtyList.some((q) => q > 0);
+    if (noColourProduct) {
+      colours.push('');
+    }
     const cat = byCat.get(categoryRaw.toLowerCase());
     if (!cat) { results.push({ line: i + 1, name, ok: false, error: `unknown category: ${categoryRaw}` }); continue; }
     // Align the per-variant lists to the colour count. Missing entries
