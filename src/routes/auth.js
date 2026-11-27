@@ -4,6 +4,7 @@ import { User } from '../models/User.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { signToken, requireAuth } from '../middleware/auth.js';
 import { loginLimit, recordLoginFailure } from '../middleware/loginLimiter.js';
+import { permsFor } from '../permissions.js';
 
 export const authRouter = Router();
 
@@ -38,7 +39,15 @@ authRouter.post('/login', loginLimit, asyncHandler(async (req, res) => {
   const token = signToken(user);
   res.json({
     token,
-    user: { id: user._id, email: user.email, name: user.name, role: user.role },
+    user: {
+      id: user._id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      // Role-derived permission list. Lets the admin UI hide nav sections
+      // the role can't use on first paint, without a second round-trip.
+      permissions: permsFor(user.role),
+    },
   });
 }));
 
@@ -46,7 +55,14 @@ authRouter.post('/login', loginLimit, asyncHandler(async (req, res) => {
 authRouter.get('/me', requireAuth, asyncHandler(async (req, res) => {
   const user = await User.findById(req.user.sub).lean();
   if (!user) return res.status(401).json({ error: 'User no longer exists' });
-  res.json({ id: user._id, email: user.email, name: user.name, role: user.role, lastLoginAt: user.lastLoginAt });
+  res.json({
+    id: user._id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+    lastLoginAt: user.lastLoginAt,
+    permissions: permsFor(user.role),
+  });
 }));
 
 // POST /api/auth/password — change own password  { current, next }

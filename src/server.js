@@ -34,6 +34,7 @@ import { customerPaymentRouter } from './routes/customerPayment.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { publicRouter } from './routes/public.js';
 import { requireAuth } from './middleware/auth.js';
+import { requirePerm, ensureMatrix } from './permissions.js';
 import { seedPiecesFromStock } from './seedPieces.js';
 import { CmsPage } from './models/CmsPage.js';
 import { Order } from './models/Order.js';
@@ -85,6 +86,10 @@ app.use(async (req, res, next) => {
         try { await ensureInvoiceCounters(); } catch (e) { console.warn('[boot] invoice counter alignment failed:', e.message); }
         try { await ensureHomeBanners(); } catch (e) { console.warn('[boot] home banners seed failed:', e.message); }
         try { await writeOffOrphanPieces(); } catch (e) { console.warn('[boot] orphan piece write-off failed:', e.message); }
+        // SEC-05: load the persisted role→permission matrix into the
+        // in-memory cache so requirePerm() has a hot answer for every
+        // subsequent request. Seeds from the static defaults on first run.
+        try { await ensureMatrix(); } catch (e) { console.warn('[boot] role-permission matrix load failed:', e.message); }
       })();
     }
     await globalThis.__bootReady;
@@ -103,28 +108,32 @@ app.use('/api/customer-auth', customerAuthRouter);
 app.use('/api/customer-auth', customerPaymentRouter);
 app.use('/api/public', publicRouter);
 
-// Protected endpoints — require a valid Bearer token
-app.use('/api/categories', requireAuth, categoriesRouter);
-app.use('/api/products', requireAuth, productsRouter);
-app.use('/api/customers', requireAuth, customersRouter);
-app.use('/api/orders', requireAuth, ordersRouter);
-app.use('/api/returns', requireAuth, returnsRouter);
-app.use('/api/shipping', requireAuth, shippingRouter);
-app.use('/api/coupons', requireAuth, couponsRouter);
-app.use('/api/reviews', requireAuth, reviewsRouter);
-app.use('/api/journal', requireAuth, journalRouter);
-app.use('/api/pages', requireAuth, pagesRouter);
-app.use('/api/scenes', requireAuth, scenesRouter);
-app.use('/api/featured', requireAuth, featuredRouter);
-app.use('/api/settings', requireAuth, settingsRouter);
+// Protected endpoints — require a valid Bearer token AND the role-based
+// permission for the module. The permission key is the admin nav id for the
+// section the route backs; see permissions.js for the catalogue and the
+// role matrix. Uploads + stats aren't gated on a single permission (every
+// authed role uses them) so they only require authentication.
+app.use('/api/categories', requireAuth, requirePerm('categories'), categoriesRouter);
+app.use('/api/products', requireAuth, requirePerm('products'), productsRouter);
+app.use('/api/customers', requireAuth, requirePerm('customers'), customersRouter);
+app.use('/api/orders', requireAuth, requirePerm('orders'), ordersRouter);
+app.use('/api/returns', requireAuth, requirePerm('returns'), returnsRouter);
+app.use('/api/shipping', requireAuth, requirePerm('shipping'), shippingRouter);
+app.use('/api/coupons', requireAuth, requirePerm('coupons'), couponsRouter);
+app.use('/api/reviews', requireAuth, requirePerm('reviews'), reviewsRouter);
+app.use('/api/journal', requireAuth, requirePerm('journal'), journalRouter);
+app.use('/api/pages', requireAuth, requirePerm('storefront'), pagesRouter);
+app.use('/api/scenes', requireAuth, requirePerm('storefront'), scenesRouter);
+app.use('/api/featured', requireAuth, requirePerm('storefront'), featuredRouter);
+app.use('/api/settings', requireAuth, requirePerm('settings'), settingsRouter);
 app.use('/api/stats', requireAuth, statsRouter);
 app.use('/api/uploads', requireAuth, uploadsRouter);
-app.use('/api/occasions', requireAuth, occasionsRouter);
-app.use('/api/price-ranges', requireAuth, priceRangesRouter);
-app.use('/api/hero-slides', requireAuth, heroSlidesRouter);
-app.use('/api/home-banners', requireAuth, homeBannersRouter);
-app.use('/api/pieces', requireAuth, piecesRouter);
-app.use('/api/movements', requireAuth, movementsRouter);
+app.use('/api/occasions', requireAuth, requirePerm('occasions'), occasionsRouter);
+app.use('/api/price-ranges', requireAuth, requirePerm('priceRanges'), priceRangesRouter);
+app.use('/api/hero-slides', requireAuth, requirePerm('storefront'), heroSlidesRouter);
+app.use('/api/home-banners', requireAuth, requirePerm('storefront'), homeBannersRouter);
+app.use('/api/pieces', requireAuth, requirePerm('barcodes'), piecesRouter);
+app.use('/api/movements', requireAuth, requirePerm('barcodes'), movementsRouter);
 
 app.use(notFound);
 app.use(errorHandler);

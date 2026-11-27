@@ -456,7 +456,12 @@ async function shipPiecesForOrder(order, { codes, by = 'System' } = {}) {
       _id: await nextMoveId(),
       code: sold._id, pid: sold.pid, vid: sold.vid,
       from: 'Packed', to: 'Sold',
-      note: `Handed to ${order.ship?.courier || 'courier'}${order.ship?.awb ? `, AWB ${order.ship.awb}` : ''}`,
+      // Storefront orders go through a courier; in-store / phone /
+      // WhatsApp / Instagram orders are handed straight to the buyer
+      // and the "courier" copy is misleading in the audit log.
+      note: String(order.source || '') === 'Storefront'
+        ? `Handed to ${order.ship?.courier || 'courier'}${order.ship?.awb ? `, AWB ${order.ship.awb}` : ''}`
+        : `Delivered in-store (${order.source || 'Manual entry'})`,
       oid: order._id, by, at,
     });
   }

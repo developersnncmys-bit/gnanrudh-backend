@@ -11,6 +11,8 @@ import { nextInvoiceNo, nextCnNo, formatInvoice, formatCreditNote } from '../inv
 import { settingsReady } from '../validators.js';
 import { recomputeCustomer } from '../crm.js';
 import { getRazorpay } from '../razorpay.js';
+import { pushOrderToShiprocket, shouldPushToShiprocket } from '../shipPush.js';
+import { testConnection as shiprocketTestConnection } from '../shiprocket.js';
 
 // AUD-01: the authenticated user is the audit trail; never trust req.body.by.
 const byFromReq = (req) => req.user?.email || 'System';
@@ -73,8 +75,43 @@ async function applyConfirmPayment(o, by) {
   await o.save();
   await logShip(o, 'Order pushed');
   await recomputeCustomer(o.cid); // DATA-04
+  // SHIP-02: push to Shiprocket in the background. Non-storefront orders
+  // (walk-in / phone / WhatsApp) are filtered out inside the helper so
+  // the admin's manual confirm-payment flow for in-store sales doesn't
+  // leak to the shipping provider.
+  if (shouldPushToShiprocket(o)) {
+    pushOrderToShiprocket(o._id).catch((err) => {
+      console.warn('[shiprocket] background push failed (admin confirm)', o._id, err?.message || err);
+    });
+  }
   return { invoiceBlockedReason };
 }
+
+// SHIP-02: admin "Retry push to Shiprocket" button. Used when the
+// first push failed (bad address, Shiprocket down, credentials
+// rotated). Awaits the push so the admin sees the real outcome
+// instead of fire-and-forget — the drawer already closes when the
+// toast comes back.
+ordersRouter.post('/:id/shiprocket-push', asyncHandler(async (req, res) => {
+  const o = await Order.findById(req.params.id).lean();
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  if (!shouldPushToShiprocket(o)) {
+    return res.status(400).json({ error: `Source "${o.source}" is not pushed to Shiprocket; only storefront orders are.` });
+  }
+  const result = await pushOrderToShiprocket(o._id);
+  if (!result.ok) return res.status(502).json({ error: result.err, step: result.step || 'push' });
+  const refreshed = await Order.findById(o._id).lean();
+  res.json({ ok: true, partial: Boolean(result.partial), order: refreshed, data: result.data });
+}));
+
+// SHIP-02: admin "Test connection" from Settings → Shipping. Verifies
+// the stored credentials by logging into Shiprocket. Returns 200 on
+// success, 502 with the Shiprocket error message on failure.
+ordersRouter.post('/shiprocket/test-connection', asyncHandler(async (req, res) => {
+  const result = await shiprocketTestConnection();
+  if (!result.ok) return res.status(502).json({ error: result.err });
+  res.json({ ok: true });
+}));
 
 // Confirm payment, generate invoice + shipping label
 ordersRouter.post('/:id/confirm-payment', asyncHandler(async (req, res) => {
@@ -270,13 +307,22 @@ ordersRouter.post('/:id/payment-status', asyncHandler(async (req, res) => {
 
 // Mark packed+shipped from the Packing bench. Also transitions the attached pieces
 // Reserved -> Packed -> Sold so stock and the audit log stay consistent (INV-01).
+// In-store orders (Walk-in / Phone / WhatsApp / Instagram / Manual entry) don't
+// go through a courier — the buyer leaves with the pieces — so they jump
+// straight to Delivered and the shipping log entry reflects the handover
+// rather than claiming a courier was involved.
 ordersRouter.post('/:id/ship', asyncHandler(async (req, res) => {
   const o = await Order.findById(req.params.id);
   if (!o) return res.status(404).json({ error: 'Order not found' });
-  o.status = 'In transit';
-  o.shippedAt = new Date().toISOString();
+  const inStore = String(o.source || '') !== 'Storefront';
+  const now = new Date().toISOString();
+  o.status = inStore ? 'Delivered' : 'In transit';
+  o.shippedAt = now;
+  if (inStore) o.deliveredAt = now;
   await o.save();
-  await logShip(o, 'Packed and handed to the courier');
+  await logShip(o, inStore
+    ? `Delivered in-store (${o.source || 'Manual entry'})`
+    : 'Packed and handed to the courier');
   await shipPiecesForOrder(o, { codes: req.body?.codes, by: byFromReq(req) });
   res.json(o.toObject());
 }));

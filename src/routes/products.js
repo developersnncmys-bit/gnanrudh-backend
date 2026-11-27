@@ -79,7 +79,13 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
     // colour. A comma is also accepted as a separator so admins who
     // think in commas don't trip on the pipe convention.
     const splitList = (s) => String(s || '').split(/[|,]/).map((x) => x.trim()).filter((x) => x.length > 0);
-    const colours = splitList(r.colour);
+    // Accept "None" (case-insensitive) as a shorthand for "no colour"
+    // so admins who pick it from the Excel dropdown end up with the
+    // same zero-variant shell as leaving the cell blank.
+    const coloursRaw = splitList(r.colour);
+    const colours = coloursRaw.length === 1 && coloursRaw[0].toLowerCase() === 'none'
+      ? []
+      : coloursRaw.filter((c) => c.toLowerCase() !== 'none');
     const hexListRaw = splitList(r.hex);
     const sizeList = splitList(r.size);
     const skuListRaw = splitList(r.sku);
@@ -95,7 +101,11 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
     if (!categoryRaw) { results.push({ line: i + 1, name, ok: false, error: 'category is empty' }); continue; }
     if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) { results.push({ line: i + 1, name, ok: false, error: 'selling_price must be a positive number' }); continue; }
     if (mrp !== null && (!Number.isFinite(mrp) || mrp <= sellingPrice)) { results.push({ line: i + 1, name, ok: false, error: 'mrp must be greater than selling_price' }); continue; }
-    if (!colours.length) { results.push({ line: i + 1, name, ok: false, error: 'colour is empty' }); continue; }
+    // colour is optional — a row without it creates a product shell
+    // (no variants, no SKU, no stock). Admin adds colour variants from
+    // the drawer later. The storefront's filter rail shows these under
+    // the "None" chip; shoppers see the card but can't buy until a
+    // variant is added.
     const cat = byCat.get(categoryRaw.toLowerCase());
     if (!cat) { results.push({ line: i + 1, name, ok: false, error: `unknown category: ${categoryRaw}` }); continue; }
     // Align the per-variant lists to the colour count. Missing entries
@@ -146,8 +156,10 @@ productsRouter.post('/bulk', asyncHandler(async (req, res) => {
             variants,
             // Product-level hex still reads from the first variant so
             // the admin's product-card swatch has something to show
-            // before a shopper picks a colour.
-            hex: variants[0].hex,
+            // before a shopper picks a colour. When colour was omitted
+            // entirely from the CSV (no variants created), fall back to
+            // a neutral grey so the swatch doesn't render as invisible.
+            hex: variants[0]?.hex || '#d8cfbf',
             // zariHex drives the stripe in the admin's colour swatch.
             // The swatch CSS is a linear-gradient of `var(--b) / var(--z)`
             // — if --z is unset the whole gradient is invalid and the

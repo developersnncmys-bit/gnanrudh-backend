@@ -7,6 +7,7 @@ import { asyncHandler } from '../middleware/asyncHandler.js';
 import { requireAuth } from '../middleware/auth.js';
 import { reservePiecesForOrder, releasePiecesForOrder } from './pieces.js';
 import { newForwardAwb } from '../awb.js';
+import { pushOrderToShiprocket, shouldPushToShiprocket } from '../shipPush.js';
 import { nextInvoiceNo, formatInvoice } from '../invoicing.js';
 import { settingsReady } from '../validators.js';
 import { recomputeCustomer } from '../crm.js';
@@ -180,6 +181,17 @@ customerPaymentRouter.post('/orders', requireAuth, requireCustomer, asyncHandler
   req.customer.orders = Array.from(new Set([...(req.customer.orders || []), order._id]));
   await req.customer.save();
 
+  // SHIP-02: COD orders don't have a verify step — push to Shiprocket at
+  // creation time so the dispatch warehouse has it right away. Prepaid
+  // orders get pushed in the /payment/verify handler after the signature
+  // check passes (see further down). Both paths gate on
+  // `shouldPushToShiprocket` so manual admin orders never leak.
+  if (paymentMethod === 'cod' && shouldPushToShiprocket(order)) {
+    pushOrderToShiprocket(order._id).catch((err) => {
+      console.warn('[shiprocket] background push failed (COD)', order._id, err?.message || err);
+    });
+  }
+
   res.status(201).json(order.toObject());
 }));
 
@@ -312,6 +324,15 @@ customerPaymentRouter.post('/payment/verify', requireAuth, requireCustomer, asyn
   }
   await o.save();
   await recomputeCustomer(o.cid);
+  // SHIP-02: push to Shiprocket in the background so a slow Shiprocket
+  // API doesn't delay the thank-you page. Any failure is recorded on the
+  // order (`ship.pushError`) and surfaced in the admin drawer with a
+  // Retry button. Non-storefront orders short-circuit inside the helper.
+  if (shouldPushToShiprocket(o)) {
+    pushOrderToShiprocket(o._id).catch((err) => {
+      console.warn('[shiprocket] background push failed', o._id, err?.message || err);
+    });
+  }
   res.json(o.toObject());
 }));
 

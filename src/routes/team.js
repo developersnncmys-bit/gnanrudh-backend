@@ -17,8 +17,47 @@ import bcrypt from 'bcryptjs';
 import { User, ROLES } from '../models/User.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
+import { PERMISSIONS, DEFAULT_ROLE_PERMISSIONS, getMatrix, setMatrix } from '../permissions.js';
 
 export const teamRouter = Router();
+
+// GET /team/role-permissions — the live role→permissions matrix plus the
+// permission catalogue (key → description) so the Settings > Team tab can
+// render the matrix. Any signed-in user can read; the data is self-
+// describing documentation, not sensitive.
+teamRouter.get(
+  '/role-permissions',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    res.json({
+      permissions: PERMISSIONS, // { key: description }
+      roles: Object.keys(DEFAULT_ROLE_PERMISSIONS),
+      matrix: getMatrix(),
+    });
+  }),
+);
+
+// PUT /team/role-permissions — owner-only. Replaces the full matrix.
+// Body: { matrix: { owner: [perm, ...], manager: [...], packer: [...], support: [...] } }
+// The owner row is force-set to all permissions on write (see permissions.js
+// normaliseMatrix) so a bad edit can't lock the admin out.
+teamRouter.put(
+  '/role-permissions',
+  requireAuth,
+  requireRole('owner'),
+  asyncHandler(async (req, res) => {
+    const next = req.body?.matrix;
+    if (!next || typeof next !== 'object') {
+      return res.status(400).json({ error: 'matrix is required and must be an object keyed by role.' });
+    }
+    try {
+      const saved = await setMatrix(next);
+      res.json({ matrix: saved });
+    } catch (err) {
+      return res.status(err.status || 500).json({ error: err.message || 'Could not save permissions.' });
+    }
+  }),
+);
 
 // Strip the passwordHash from any response. Nothing else on the admin
 // client should ever see it.

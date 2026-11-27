@@ -28,6 +28,18 @@ const ShipSchema = new mongoose.Schema({
   rate: Number,
   pin: { type: String, validate: optPincodeValidator },
   etd: String,
+  // SHIP-02: Shiprocket push state. Populated when an order lands on the
+  // Shiprocket dashboard; stays null for in-store / phone / walk-in
+  // orders which never get pushed.
+  // `shiprocketOrderId`   → the id Shiprocket assigns to the order row
+  // `shiprocketShipmentId` → the shipment id used for AWB + pickup calls
+  // `pushedAt`            → ISO timestamp of the last successful push
+  // `pushError`           → human-readable error from the most recent
+  //                         failed attempt; cleared on retry success
+  shiprocketOrderId: { type: String, default: null },
+  shiprocketShipmentId: { type: String, default: null },
+  pushedAt: { type: String, default: null },
+  pushError: { type: String, default: null },
 }, { _id: false });
 
 const OrderSchema = new mongoose.Schema({
