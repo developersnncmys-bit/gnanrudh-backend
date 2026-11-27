@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { pathToFileURL } from 'url';
+import mongoose from 'mongoose';
 import { config } from './config.js';
 import { connectDB } from './db.js';
 import { errorHandler, notFound } from './middleware/asyncHandler.js';
@@ -44,6 +45,13 @@ const app = express();
 
 // SEC-04: trust the Vercel proxy so req.ip and X-Forwarded-For hold the real client IP.
 app.set('trust proxy', 1);
+app.use((req, res, next) => {
+  const started = Date.now();
+  const path = req.path;
+  console.log(`[request] ${req.method} ${path} START`);
+  res.once('finish', () => console.log(`[request] ${req.method} ${path} ${res.statusCode} ${Date.now() - started}ms`));
+  next();
+});
 
 // CORS allow-list:
 //   1. Exact origins from CORS_ORIGIN env (prod domains + localhost).
@@ -69,39 +77,62 @@ app.use(cors({
 // Webhooks mount BEFORE express.json() because Razorpay's HMAC verification
 // needs the EXACT raw body bytes — parsing and re-stringifying JSON breaks
 // the signature. The webhook route uses its own express.raw() middleware.
-app.use('/api/webhooks', webhooksRouter);
+app.use('/api/webhooks', async (req, res, next) => {
+  try { await timed('webhook.connectDB', connectDB); next(); }
+  catch (err) { console.error('[webhook database]', err.message); res.status(503).json({ error: 'Service temporarily unavailable' }); }
+}, webhooksRouter);
 
 app.use(express.json({ limit: '2mb' }));
 
-// Ensure DB is connected before handling any request (safe for serverless cold starts).
-// Also run one-shot boot tasks (index sync + dev-seed patches) exactly once per
-// process — `globalThis.__bootReady` is cached by the serverless runtime across requests.
-app.use(async (req, res, next) => {
-  try {
-    await connectDB();
-    if (!globalThis.__bootReady) {
-      globalThis.__bootReady = (async () => {
-        try { await Order.syncIndexes(); } catch (e) { console.warn('[boot] Order.syncIndexes failed:', e.message); }
-        try { await ensureDevSellerDetails(); } catch (e) { console.warn('[boot] dev seller upsert failed:', e.message); }
-        try { await ensureInvoiceCounters(); } catch (e) { console.warn('[boot] invoice counter alignment failed:', e.message); }
-        try { await ensureHomeBanners(); } catch (e) { console.warn('[boot] home banners seed failed:', e.message); }
-        try { await writeOffOrphanPieces(); } catch (e) { console.warn('[boot] orphan piece write-off failed:', e.message); }
-        // SEC-05: load the persisted role→permission matrix into the
-        // in-memory cache so requirePerm() has a hot answer for every
-        // subsequent request. Seeds from the static defaults on first run.
-        try { await ensureMatrix(); } catch (e) { console.warn('[boot] role-permission matrix load failed:', e.message); }
-      })();
-    }
-    await globalThis.__bootReady;
-    next();
-  } catch (e) { next(e); }
-});
+// Liveness is independent of database and maintenance work.
+app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// Serve uploaded files publicly (no CORS needed — <img>/<video> tags don't check CORS)
+async function timed(name, fn) {
+  const start = Date.now();
+  console.log(`[PERF] ${name} START`);
+  try { return await fn(); }
+  finally { console.log(`[PERF] ${name} END ${Date.now() - start}ms`); }
+}
+
+// Load persisted permissions once per instance, retry on failure.
+// Do not continue with default permissions after a failed initialization.
+let permissionsReady;
+function initPermissions() {
+  if (!permissionsReady) {
+    permissionsReady = timed('ensureMatrix', ensureMatrix).catch(err => {
+      permissionsReady = undefined;
+      throw err;
+    });
+  }
+  return permissionsReady;
+}
+
 app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '7d', immutable: true }));
 
-// Public endpoints
-app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+// Readiness checks database connectivity without running migrations.
+app.get('/api/ready', async (req, res) => {
+  try {
+    await timed('readiness.connectDB', connectDB);
+    await mongoose.connection.db.command({ ping: 1 });
+    res.json({ ok: true, database: 'connected' });
+  } catch (err) {
+    console.error('[ready]', err.message);
+    res.status(503).json({ ok: false, database: 'unavailable' });
+  }
+});
+
+// Only essential initialization in API request path.
+app.use('/api', async (req, res, next) => {
+  try {
+    await timed('connectDB', connectDB);
+    await initPermissions();
+    next();
+  } catch (err) {
+    console.error('[api initialization]', err.message);
+    res.status(503).json({ error: 'Service temporarily unavailable' });
+  }
+});
+
 app.use('/api/auth', authRouter);
 app.use('/api/team', teamRouter);
 app.use('/api/customer-auth', customerAuthRouter);
@@ -144,16 +175,15 @@ export default app;
 // longer resolves to a live Product (left behind by pre-cascade deletes)
 // and writes them off. Only touches outstanding states — Sold / Returned
 // pieces stay in their terminal shape so revenue reports and refund
-// windows keep their history. Runs once per process; subsequent restarts
-// find nothing to do and exit in a single query.
+// windows keep their history. Run explicitly during reviewed maintenance.
 async function writeOffOrphanPieces() {
   const pending = await Piece.find({ status: { $in: ['In stock', 'Reserved', 'Packed'] } }).lean();
   if (!pending.length) return;
   const uniquePids = [...new Set(pending.map((p) => p.pid).filter(Boolean))];
   const liveProducts = await Product.find({ _id: { $in: uniquePids } }).select('_id').lean();
-  const livePidSet = new Set(liveProducts.map((p) => p._id));
+  const livePidSet = new Set(liveProducts.map((p) => String(p._id)));
   const orphanIds = pending
-    .filter((p) => p.pid && !livePidSet.has(p.pid))
+    .filter((p) => p.pid && !livePidSet.has(String(p.pid)))
     .map((p) => p._id);
   if (!orphanIds.length) return;
   console.log(`[boot] writing off ${orphanIds.length} orphan piece(s) from deleted products…`);
@@ -165,7 +195,7 @@ async function writeOffOrphanPieces() {
       await recordMove(piece, 'Written off', 'Product no longer in catalogue', { by: 'System', oid: null });
       done += 1;
     } catch (err) {
-      console.warn(`[boot] piece ${code} write-off failed:`, err.message);
+      throw new Error(`Piece ${code} write-off failed`, { cause: err });
     }
   }
   console.log(`[boot] wrote off ${done} orphan piece(s).`);
@@ -253,11 +283,13 @@ async function ensureHomePage() {
 // what the storefront's CraftStory.tsx currently hardcodes so the storefront
 // shows the same copy on a fresh DB. Also drops any leftover 'explore' row
 // from the brief window when Explore was also admin-controlled — the model
-// enum rejects writes to that slot now, but a stray row would still read
-// out via the public endpoint.
+// enum rejects writes to that slot now. Removal is opt-in.
 async function ensureHomeBanners() {
   const { HomeBanner } = await import('./models/HomeBanner.js');
-  await HomeBanner.deleteOne({ slot: 'explore' });
+  // Legacy explore removal is opt-in to avoid deleting production data.
+  if (process.argv.includes('--remove-legacy-explore')) {
+    await HomeBanner.deleteOne({ slot: 'explore' });
+  }
   await HomeBanner.updateOne(
     { slot: 'bridal' },
     {
@@ -273,26 +305,43 @@ async function ensureHomeBanners() {
   );
 }
 
-// Only start a listening HTTP server when run directly (local dev).
-// On Vercel, the file is imported as a serverless function and this block is skipped.
-// On Windows, import.meta.url is `file:///C:/...` (three slashes) while a
-// hand-rolled `file://${argv[1]}` has two. Use pathToFileURL so the comparison
-// works on both Windows and POSIX.
+// Explicit maintenance CLI. Run from backend directory against the intended DB.
+// Never invoked when Vercel imports this module.
 if (process.env.VERCEL !== '1' && process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   (async () => {
     await connectDB();
-    try {
-      const r = await seedPiecesFromStock();
-      if (!r.skipped) console.log(`[server] seeded ${r.seeded} pieces from existing stock`);
-    } catch (e) { console.warn('[server] piece seed failed:', e.message); }
-    try { await ensureHomePage(); } catch (e) { console.warn('[server] home page upsert failed:', e.message); }
-    // Order.syncIndexes + ensureDevSellerDetails run from the connectDB middleware
-    // on first request, so they cover both local dev and Vercel cold starts.
+    if (process.argv.includes('--maintenance')) {
+      if (!process.argv.includes('--confirm-db')) {
+        throw new Error('Review database target and back up data; pass --confirm-db to proceed');
+      }
+      if (process.argv.includes('--dev-seed') && process.env.NODE_ENV === 'production') {
+        throw new Error('Dev seeding is forbidden in production');
+      }
+      // createIndexes does not drop unrelated existing indexes like syncIndexes can.
+      await timed('Order.createIndexes', () => Order.createIndexes());
+      await timed('ensureInvoiceCounters', ensureInvoiceCounters);
+      await timed('ensureHomePage', ensureHomePage);
+      await timed('ensureHomeBanners', ensureHomeBanners);
+      await timed('ensureMatrix', ensureMatrix);
+      if (process.argv.includes('--cleanup-orphans')) {
+        await timed('writeOffOrphanPieces', writeOffOrphanPieces);
+      }
+      if (process.argv.includes('--dev-seed')) {
+        if (process.env.NODE_ENV === 'production') throw new Error('Dev seeding is forbidden in production');
+        await timed('ensureDevSellerDetails', ensureDevSellerDetails);
+        await timed('seedPiecesFromStock', seedPiecesFromStock);
+      }
+      await mongoose.disconnect();
+      console.log('[maintenance] complete');
+      return;
+    }
+    await initPermissions();
     app.listen(config.port, () => {
       console.log(`[server] listening on http://localhost:${config.port}`);
     });
-  })().catch((err) => {
+  })().catch(async err => {
     console.error('[server] fatal', err);
-    process.exit(1);
+    await mongoose.disconnect().catch(() => {});
+    process.exitCode = 1;
   });
 }
