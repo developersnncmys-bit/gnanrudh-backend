@@ -12,11 +12,12 @@
 //                                  to disable pushes without removing
 //                                  the credentials (useful in staging).
 //
-// Three API endpoints we call for a storefront order:
+// API endpoints we call for a storefront order:
 //   1. POST /v1/external/auth/login              → bearer token (10-day life)
 //   2. POST /v1/external/orders/create/adhoc     → register order + items
-//   3. POST /v1/external/courier/assign/awb      → pick courier + AWB
-//   4. POST /v1/external/courier/generate/pickup → schedule pickup
+//
+// AWB assignment and pickup scheduling are intentionally NOT automated
+// — staff do those from the Shiprocket dashboard per order.
 //
 // The bearer token is cached in-memory (module-level) with a 9-day TTL
 // — one day shy of Shiprocket's 10-day expiry. A cold start re-logs in;
@@ -138,19 +139,15 @@ export async function testConnection() {
 }
 
 export async function createAdhocOrder(orderPayload) {
-  return request('/orders/create/adhoc', { body: orderPayload });
-}
-
-// Request an AWB for a shipment. `courierId` is optional — when omitted
-// Shiprocket picks the cheapest available courier for the pincode.
-export async function assignAwb(shipmentId, courierId = null) {
-  const body = { shipment_id: shipmentId };
-  if (courierId) body.courier_id = courierId;
-  return request('/courier/assign/awb', { body });
-}
-
-export async function generatePickup(shipmentId) {
-  return request('/courier/generate/pickup', { body: { shipment_id: [shipmentId] } });
+  const r = await request('/orders/create/adhoc', { body: orderPayload });
+  // Shiprocket sometimes returns 200 with an error `message` and no
+  // order_id / shipment_id (e.g. "Wrong Pickup location entered"). Treat
+  // that as a failure so the caller doesn't mark the order as pushed
+  // and the admin drawer surfaces the real reason via pushError.
+  if (r.ok && !r.data?.order_id && !r.data?.shipment_id) {
+    return { ok: false, err: r.data?.message || 'Shiprocket returned 200 with no order_id', httpStatus: 200, data: r.data };
+  }
+  return r;
 }
 
 export async function cancelShiprocketOrder(shiprocketOrderId) {
@@ -163,15 +160,18 @@ export function buildAdhocOrderPayload({ order, customer, products }) {
   const creds = readShiprocketCreds();
   const pickup = creds.pickupLocation || 'Primary';
   const addr = order.ship || {};
-  const shipAddress = customer?.addresses?.find((a) => a.pincode === addr.pin) || customer?.addresses?.[0] || {};
+  // Customer.addresses is a Number (legacy count); the real address array
+  // is Customer.addressBook. Match on `pin` (schema field), not `pincode`.
+  const addressBook = Array.isArray(customer?.addressBook) ? customer.addressBook : [];
+  const shipAddress = addressBook.find((a) => a.pin === addr.pin) || addressBook[0] || {};
   const billing = order.billingGstin
     ? {
-      billing_customer_name: order.billingName || shipAddress.fullName || customer?.name || '—',
+      billing_customer_name: order.billingName || shipAddress.name || customer?.name || '—',
       billing_last_name: '',
       billing_address: order.billingAddress || shipAddress.line1 || '',
       billing_city: shipAddress.city || '',
       billing_state: shipAddress.state || '',
-      billing_pincode: String(addr.pin || shipAddress.pincode || ''),
+      billing_pincode: String(addr.pin || shipAddress.pin || ''),
       billing_country: shipAddress.country || 'India',
       billing_email: customer?.email || '',
       billing_phone: customer?.phone || shipAddress.phone || '',
@@ -182,24 +182,30 @@ export function buildAdhocOrderPayload({ order, customer, products }) {
   const totalWeightKg = Math.max(0.1, (order.items || []).reduce((a, it) => a + 0.4 * (it.qty || 1), 0));
   const items = (order.items || []).map((it) => {
     const p = products?.[it.pid] || {};
+    // Shiprocket rejects the whole order with 422 "Oops! Invalid Data"
+    // when HSN is non-numeric (e.g. a placeholder like "yeuytque" left
+    // on a draft product). Empty HSN is accepted — prefer that over a
+    // bad value so a catalog hygiene issue doesn't block a shipment.
+    const rawHsn = String(p.hsn || '').trim();
+    const hsn = /^\d{1,15}$/.test(rawHsn) ? rawHsn : '';
     return {
       name: p.name || it.pid,
       sku: it.vid || it.pid,
       units: it.qty || 1,
       selling_price: it.price,
-      hsn: p.hsn || '',
+      hsn,
     };
   });
   return {
     order_id: order._id,
     order_date: (order.placed || new Date().toISOString()).slice(0, 10),
     pickup_location: pickup,
-    billing_customer_name: shipAddress.fullName || customer?.name || '—',
+    billing_customer_name: shipAddress.name || customer?.name || '—',
     billing_last_name: '',
     billing_address: shipAddress.line1 || '',
     billing_address_2: shipAddress.line2 || '',
     billing_city: shipAddress.city || '',
-    billing_pincode: String(addr.pin || shipAddress.pincode || ''),
+    billing_pincode: String(addr.pin || shipAddress.pin || ''),
     billing_state: shipAddress.state || '',
     billing_country: shipAddress.country || 'India',
     billing_email: customer?.email || '',

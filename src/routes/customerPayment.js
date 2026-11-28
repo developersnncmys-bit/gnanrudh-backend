@@ -55,6 +55,27 @@ function newOrderId() {
   return `GR-${ts}${rand}`;
 }
 
+// Cart signature used by the pending-order dedupe below. Order-insensitive
+// over (pid, vid, qty) so two carts holding the same line items in any
+// order collapse to the same key. Line-level `stitch` (customisation
+// options) is intentionally NOT in the signature — the admin treats a
+// stitched line and a plain line as different intents, so we would never
+// want to collapse them into one pending order. Exported-shape isn't
+// public; this helper only exists for the one call site below.
+function cartSignature(lines) {
+  return (lines || [])
+    .map((l) => `${l.pid || ''}:${l.vid || ''}:${Number(l.qty) || 0}`)
+    .sort()
+    .join('|');
+}
+
+// Dedupe window: an abandoned first attempt within the last 10 minutes
+// with an identical cart gets reused instead of spawning a duplicate
+// Payment pending order. Short enough that a customer deliberately
+// placing a second identical order after ~15 min gets a fresh row; long
+// enough to cover the normal "closed the tab, retried from the cart" case.
+const PENDING_DEDUPE_MS = 10 * 60 * 1000;
+
 // ─── Customer orders ──────────────────────────────────────────────────
 
 // POST /api/customer-auth/orders
@@ -136,6 +157,59 @@ customerPaymentRouter.post('/orders', requireAuth, requireCustomer, asyncHandler
     return res.status(400).json({ error: 'billingName is required when billingGstin is set' });
   }
 
+  // Dedupe: if this same customer already has a recent Payment pending
+  // order with identical items + method + total + delivery pin + billing
+  // GSTIN, return THAT order instead of creating a new one.
+  //
+  // Prevents the ghost-order pattern we've seen (GR-MWZYFOUDFAA7 /
+  // GR-MWZYFO5APYNU, and the earlier GR-MWYLNLX69ZIJ / GR-MWYLNLDTPQ3I
+  // pair): first attempt → Razorpay modal → customer closed the tab / lost
+  // signal before onDismiss fired → stale pending order with pieces
+  // reserved → customer retries → second order created → first one
+  // orphaned. On the retry we now hand back the first order so the
+  // customer finishes paying for THAT one, pieces aren't double-reserved,
+  // and the admin dashboard isn't cluttered with ghosts.
+  //
+  // Narrow filter: requires an EXACT match across cart signature,
+  // payment method bucket, delivery pin, billing GSTIN and total (to
+  // the paisa). Any difference → new order intent → not deduped.
+  const incomingMethod = paymentMethod === 'cod' ? 'Cash on delivery' : 'Prepaid';
+  const incomingSig = cartSignature(lines);
+  const windowStart = new Date(Date.now() - PENDING_DEDUPE_MS).toISOString();
+  const candidates = await Order.find({
+    cid: req.customer._id,
+    status: 'Payment pending',
+    placed: { $gte: windowStart },
+  }).sort({ placed: -1 }).limit(5);
+
+  for (const existing of candidates) {
+    if (cartSignature(existing.items) !== incomingSig) continue;
+    if ((existing.payment?.method || '') !== incomingMethod) continue;
+    if (Math.round(Number(existing.total || 0)) !== Math.round(total)) continue;
+    if (String(existing.ship?.pin || '') !== String(address.pin)) continue;
+    if ((existing.billingGstin || '') !== billingGstin) continue;
+
+    // Match. Reuse the existing pending order.
+    // - Pieces are already reserved against it (don't re-reserve).
+    // - `payment.rzpOrderId` from the earlier attempt is left as-is; the
+    //   client's next call to /payment/order will mint a fresh Razorpay
+    //   order id and overwrite the stored one (Razorpay orders are
+    //   single-use so the old one would 400 on re-open anyway).
+    // - billingName / billingAddress may have been edited between
+    //   attempts; keep them in sync with the latest values the client
+    //   sent so the invoice prints what the customer last confirmed.
+    let touched = false;
+    if ((existing.billingName || '') !== billingName) { existing.billingName = billingName; touched = true; }
+    if ((existing.billingAddress || '') !== billingAddress) { existing.billingAddress = billingAddress; touched = true; }
+    if (touched) await existing.save();
+
+    console.log(
+      `[orders] dedupe hit: reusing ${existing._id} for customer ${req.customer._id} ` +
+      `(sig=${incomingSig}, total=${total}, pin=${address.pin})`,
+    );
+    return res.status(200).json(existing.toObject());
+  }
+
   const order = await Order.create({
     _id: newOrderId(),
     placed: new Date().toISOString(),
@@ -148,7 +222,7 @@ customerPaymentRouter.post('/orders', requireAuth, requireCustomer, asyncHandler
     tax,
     total,
     payment: {
-      method: paymentMethod === 'cod' ? 'Cash on delivery' : 'Prepaid',
+      method: incomingMethod,
       status: 'Payment pending',
       rzp: null,
     },

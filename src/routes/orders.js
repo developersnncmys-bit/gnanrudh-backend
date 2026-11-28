@@ -101,7 +101,7 @@ ordersRouter.post('/:id/shiprocket-push', asyncHandler(async (req, res) => {
   const result = await pushOrderToShiprocket(o._id);
   if (!result.ok) return res.status(502).json({ error: result.err, step: result.step || 'push' });
   const refreshed = await Order.findById(o._id).lean();
-  res.json({ ok: true, partial: Boolean(result.partial), order: refreshed, data: result.data });
+  res.json({ ok: true, order: refreshed, data: result.data });
 }));
 
 // SHIP-02: admin "Test connection" from Settings → Shipping. Verifies

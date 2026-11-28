@@ -1,13 +1,10 @@
 // SHIP-02: push a storefront order to Shiprocket.
 //
-// Three-step flow per Shiprocket's docs:
-//   1. createAdhocOrder  → returns shiprocket order_id + shipment_id
-//   2. assignAwb         → returns awb_code + courier_name
-//   3. generatePickup    → schedules a pickup
-//
-// Each step is independently non-blocking — if step 2 fails, the order
-// still has a shiprocket id and the admin can retry from the drawer.
-// Any failure writes a human-readable message to `order.ship.pushError`.
+// Single-step push: createAdhocOrder lands the order on Shiprocket's
+// dashboard. AWB assignment and pickup scheduling are intentionally
+// NOT automated — staff do those from the Shiprocket dashboard so they
+// can pick the courier per order. Any failure writes a human-readable
+// message to `order.ship.pushError`.
 //
 // Orders are gated on `source === 'Storefront'`. Manual admin entries
 // (Phone / WhatsApp / Walk-in / Instagram) never reach Shiprocket —
@@ -19,8 +16,6 @@ import { Product } from './models/Product.js';
 import {
   buildAdhocOrderPayload,
   createAdhocOrder,
-  assignAwb,
-  generatePickup,
   isShiprocketConfigured,
 } from './shiprocket.js';
 
@@ -48,7 +43,6 @@ export async function pushOrderToShiprocket(orderId) {
 
   const payload = await buildAdhocOrderPayload({ order, customer, products: productsMap });
 
-  // Step 1: create order on Shiprocket.
   const create = await createAdhocOrder(payload);
   if (!create.ok) {
     order.ship = order.ship || {};
@@ -63,41 +57,9 @@ export async function pushOrderToShiprocket(orderId) {
   order.ship.shiprocketShipmentId = shipmentId;
   order.ship.pushedAt = new Date().toISOString();
   order.ship.pushError = null;
-
-  // Step 2: AWB. Shiprocket picks the cheapest available courier when
-  // no courier_id is supplied — the admin can switch couriers later
-  // from the Shiprocket dashboard without another push.
-  if (shipmentId) {
-    const awb = await assignAwb(shipmentId);
-    if (awb.ok) {
-      const awbData = awb.data?.response?.data || {};
-      if (awbData.awb_code) order.ship.awb = String(awbData.awb_code);
-      if (awbData.courier_name) order.ship.courier = String(awbData.courier_name);
-    } else {
-      order.ship.pushError = `assignAwb: ${awb.err}`;
-      await order.save();
-      return { ok: true, partial: true, err: awb.err, step: 'assignAwb', data: { shiprocketOrderId, shipmentId } };
-    }
-  }
-
-  // Step 3: pickup. Best-effort — if this fails, admin can schedule from
-  // the Shiprocket dashboard manually. Don't surface as an error since
-  // the shipment is otherwise ready to roll.
-  if (shipmentId) {
-    const pickup = await generatePickup(shipmentId);
-    if (!pickup.ok) {
-      order.ship.pushError = `generatePickup: ${pickup.err} (shipment created, request pickup from Shiprocket dashboard)`;
-    }
-  }
-
   await order.save();
   return {
     ok: true,
-    data: {
-      shiprocketOrderId,
-      shipmentId,
-      awb: order.ship.awb,
-      courier: order.ship.courier,
-    },
+    data: { shiprocketOrderId, shipmentId },
   };
 }

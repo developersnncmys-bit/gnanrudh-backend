@@ -37,6 +37,25 @@ import { publicRouter } from './routes/public.js';
 import { requireAuth } from './middleware/auth.js';
 import { requirePerm, ensureMatrix } from './permissions.js';
 import { seedPiecesFromStock } from './seedPieces.js';
+import { isShiprocketConfigured } from './shiprocket.js';
+
+// SHIP-02 startup visibility: this silently skipped once (orders placed but
+// never pushed) because the running process had been started before the
+// SHIPROCKET_* env vars existed. Log the state on every boot so the next
+// time the creds are missing it's obvious from the first line of the log.
+(() => {
+  if (isShiprocketConfigured()) {
+    const email = process.env.SHIPROCKET_EMAIL;
+    const pickup = process.env.SHIPROCKET_PICKUP_LOCATION || 'Primary';
+    console.log(`[shiprocket] ENABLED — account=${email}, pickup=${pickup}`);
+  } else {
+    const explicitlyOff = ['false', '0', 'off'].includes(String(process.env.SHIPROCKET_ENABLED || '').toLowerCase());
+    const reason = explicitlyOff
+      ? 'SHIPROCKET_ENABLED is false'
+      : 'SHIPROCKET_EMAIL / SHIPROCKET_PASSWORD not set in this process env';
+    console.warn(`[shiprocket] DISABLED — ${reason}. Storefront orders will NOT auto-push.`);
+  }
+})();
 import { CmsPage } from './models/CmsPage.js';
 import { Order } from './models/Order.js';
 import { Singleton } from './models/Singleton.js';
